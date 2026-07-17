@@ -1,0 +1,35 @@
+{
+  "marker": "MC6845_PRECISE_V1",
+  "files": [
+    {
+      "path": "/home/nocona/86Box/src/include/86box/vid_cga.h",
+      "backup": "/home/nocona/86Box/src/include/86box/vid_cga.h.pre-mc6845_precise_v1-20260717-081105",
+      "created": "0"
+    },
+    {
+      "path": "/home/nocona/86Box/src/video/vid_cga.c",
+      "backup": "/home/nocona/86Box/src/video/vid_cga.c.pre-mc6845_precise_v1-20260717-081105",
+      "created": "0"
+    },
+    {
+      "path": "/home/nocona/86Box/src/video/CMakeLists.txt",
+      "backup": "/home/nocona/86Box/src/video/CMakeLists.txt.pre-mc6845_precise_v1-20260717-081105",
+      "created": "0"
+    },
+    {
+      "path": "/home/nocona/86Box/src/include/86box/vid_mc6845.h",
+      "backup": "",
+      "created": "1"
+    },
+    {
+      "path": "/home/nocona/86Box/src/video/vid_mc6845.c",
+      "backup": "",
+      "created": "1"
+    },
+    {
+      "path": "/home/nocona/86Box/src/video/vid_cga_precise.c",
+      "backup": "",
+      "created": "1"
+    }
+  ]
+}

@@ -53,8 +53,6 @@ add_library(vid OBJECT
 
     # CGA / Super CGA
     vid_cga.c
-    vid_mc6845.c
-    vid_cga_precise.c
     vid_cga_comp.c
     vid_cga_compaq.c 
     vid_cga_compaq_plasma.c

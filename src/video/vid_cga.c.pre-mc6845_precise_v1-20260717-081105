@@ -73,14 +73,10 @@ void cga_recalctimings(cga_t *cga);
 static void
 cga_update_latch(cga_t *cga)
 {
-    if (cga->precise_enabled) {
-        mc6845_core_latch_lightpen(&cga->precise_crtc);
-    } else {
-        uint32_t lp_latch = cga->displine * cga->crtc[CGA_CRTC_HDISP];
+    uint32_t lp_latch = cga->displine * cga->crtc[CGA_CRTC_HDISP];
 
-        cga->crtc[CGA_CRTC_LIGHT_PEN_ADDR_HIGH] = (lp_latch >> 8) & 0x3f;
-        cga->crtc[CGA_CRTC_LIGHT_PEN_ADDR_LOW] = lp_latch & 0xff;
-    }
+    cga->crtc[CGA_CRTC_LIGHT_PEN_ADDR_HIGH] = (lp_latch >> 8) & 0x3f;
+    cga->crtc[CGA_CRTC_LIGHT_PEN_ADDR_LOW] = lp_latch & 0xff;
 }
 
 void
@@ -97,12 +93,9 @@ cga_out(uint16_t addr, uint8_t val, void *priv)
             cga->crtcreg = val & 31;
             return;
         case CGA_REGISTER_CRTC_DATA:
-            old = cga->crtc[cga->crtcreg];
-            if (cga->precise_enabled)
-                mc6845_core_select_write(&cga->precise_crtc, cga->crtcreg, val);
-            else
-                cga->crtc[cga->crtcreg] = val & crtcmask[cga->crtcreg];
-            if (old != cga->crtc[cga->crtcreg]) {
+            old                     = cga->crtc[cga->crtcreg];
+            cga->crtc[cga->crtcreg] = val & crtcmask[cga->crtcreg];
+            if (old != val) {
                 // Recalc the timings if we are writing any invalid CRTC register or a valid CRTC register 
                 // except the CURSOR and LIGHT PEN registers
                 if ((cga->crtcreg < 0xe) || (cga->crtcreg > 0x11)) {
@@ -118,8 +111,6 @@ cga_out(uint16_t addr, uint8_t val, void *priv)
         case CGA_REGISTER_MODE_CONTROL:
             old          = cga->cgamode;
             cga->cgamode = val;
-            if (cga->precise_enabled)
-                cga_precise_mode_write(cga, val);
 
             if (old ^ val) {
                 if ((old ^ val) & 0x07)
@@ -170,9 +161,7 @@ cga_in(uint16_t addr, void *priv)
             ret = cga->crtcreg;
             break;
         case CGA_REGISTER_CRTC_DATA:
-            ret = cga->precise_enabled
-                ? mc6845_core_select_read(&cga->precise_crtc, cga->crtcreg)
-                : cga->crtc[cga->crtcreg];
+            ret = cga->crtc[cga->crtcreg];
             break;
         case CGA_REGISTER_STATUS:
             ret = cga->cgastat;
@@ -228,7 +217,7 @@ cga_write(uint32_t addr, uint8_t val, void *priv)
 
     cga->vram[addr & DEVICE_VRAM_MASK] = val;
     if (cga->snow_enabled) {
-        int offset                  = cga->precise_enabled ? ((cga->precise_crtc.hcc * 2) & 0xfc) : (((timer_get_remaining_u64(&cga->timer) / CGACONST) * 2) & 0xfc);
+        int offset                  = ((timer_get_remaining_u64(&cga->timer) / CGACONST) * 2) & 0xfc;
         cga->charbuffer[offset]     = cga->vram[addr & DEVICE_VRAM_MASK];
         cga->charbuffer[offset | 1] = cga->vram[addr & DEVICE_VRAM_MASK];
     }
@@ -242,7 +231,7 @@ cga_read(uint32_t addr, void *priv)
 
     cga_waitstates(cga);
     if (cga->snow_enabled) {
-        int offset                  = cga->precise_enabled ? ((cga->precise_crtc.hcc * 2) & 0xfc) : (((timer_get_remaining_u64(&cga->timer) / CGACONST) * 2) & 0xfc);
+        int offset                  = ((timer_get_remaining_u64(&cga->timer) / CGACONST) * 2) & 0xfc;
         cga->charbuffer[offset]     = cga->vram[addr & DEVICE_VRAM_MASK];
         cga->charbuffer[offset | 1] = cga->vram[addr & DEVICE_VRAM_MASK];
     }
@@ -255,9 +244,6 @@ cga_recalctimings(cga_t *cga)
     double disptime;
     double _dispontime;
     double _dispofftime;
-
-    /* MC6845_PRECISE_V1: precise dot-clock changes are latched by
-     * cga_precise_mode_write() on LCLOCK boundaries. */
 
     if (cga->cgamode & CGA_MODE_FLAG_HIGHRES) {
         disptime    = (double) (cga->crtc[CGA_CRTC_HTOTAL] + 1);
@@ -572,8 +558,8 @@ cga_do_blit(int vid_xsize, int firstline, int lastline, int double_type)
     }
 }
 
-static void
-cga_poll_legacy(void *priv)
+void
+cga_poll(void *priv)
 {
     cga_t   *cga = (cga_t *) priv;
     int      x;
@@ -770,19 +756,6 @@ cga_poll_legacy(void *priv)
     }
 }
 
-
-/* MC6845_PRECISE_V1: retain legacy timing for derivative adapters. */
-void
-cga_poll(void *priv)
-{
-    cga_t *cga = (cga_t *) priv;
-
-    if (cga->precise_enabled)
-        cga_poll_precise(priv);
-    else
-        cga_poll_legacy(priv);
-}
-
 void
 cga_init(cga_t *cga)
 {
@@ -804,9 +777,6 @@ cga_standalone_init(UNUSED(const device_t *info))
     cga->snow_enabled = device_get_config_int("snow_enabled");
 
     cga->vram = calloc(1, DEVICE_VRAM);
-
-    /* MC6845_PRECISE_V1: enable only for the standalone IBM CGA. */
-    cga_precise_init(cga);
 
     cga_comp_init(cga->revision);
     timer_add(&cga->timer, cga_poll, cga, 1);

@@ -19,8 +19,6 @@
 #ifndef VIDEO_CGA_H
 #define VIDEO_CGA_H
 
-#include <86box/vid_mc6845.h>
-
 // Mode flags for the CGA.
 // Set by writing to 3D8
 typedef enum cga_mode_flags_e {
@@ -115,44 +113,8 @@ typedef struct cga_t {
     int snow_enabled;
     int rgb_type;
     int double_type;
-
-    /* MC6845_PRECISE_V1: character-clock state used only by standalone IBM CGA. */
-    mc6845_core_t precise_crtc;
-    uint64_t precise_char_time;
-    int precise_beam_x;
-    int precise_beam_y;
-    int precise_max_x;
-    int precise_max_y;
-    int precise_active_min_x;
-    int precise_active_min_y;
-    int precise_active_max_x;
-    int precise_active_max_y;
-    uint8_t precise_enabled;
-    uint8_t precise_prev_hsync;
-    uint8_t precise_prev_vsync;
-    uint8_t precise_frame_valid;
-    int precise_hblank_pixels;
-    int precise_hblank_target;
-    uint32_t precise_vsync_dots;
-    uint8_t precise_monitor_hblank;
-    uint8_t precise_monitor_vsync;
-    uint8_t precise_frame_hires;
-    uint8_t precise_mode;
-    uint8_t precise_pending_mode;
-    uint8_t precise_mode_pending;
-    uint8_t precise_clock_high;
-    uint8_t precise_clock_pending;
-    uint8_t precise_monitor_locked;
-    uint32_t precise_master_phase;
-    uint8_t precise_sync_pending;
-    uint8_t precise_card_vsync;
-    uint8_t precise_card_vsync_lines;
 } cga_t;
 
-
-extern void    cga_precise_init(cga_t *cga);
-extern void    cga_poll_precise(void *priv);
-extern void    cga_precise_mode_write(cga_t *cga, uint8_t mode);
 extern void    cga_init(cga_t *cga);
 extern void    cga_out(uint16_t addr, uint8_t val, void *priv);
 extern uint8_t cga_in(uint16_t addr, void *priv);
