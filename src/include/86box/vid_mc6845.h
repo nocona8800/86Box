@@ -9,15 +9,12 @@ extern "C" {
 #endif
 
 /*
- * Character-clock MC6845 core for 86Box.
+ * Character-clock Motorola MC6845 core for 86Box.
  *
- * The register file may be owned by the caller. This is intentional: existing
- * 86Box video devices can keep their public crtc[] array while this core owns
- * the counters, latches and output pins that were previously absent.
- *
- * State-machine structure follows the MC6845 coincidence-counter model and is
- * informed by the CRTC Compendium and the MIT-licensed MartyPC implementation
- * by Daniel Balsom. No MartyPC source code is copied verbatim.
+ * The register file may be owned by the caller.  Direct writes to that shared
+ * file are detected at the beginning of the next character clock, while
+ * mc6845_core_select_write() applies the same hardware side effects
+ * immediately.
  */
 
 enum {
@@ -64,6 +61,10 @@ typedef struct mc6845_outputs_t {
 typedef struct mc6845_core_t {
     uint8_t *reg;
     uint8_t  owned_reg[MC6845_REG_COUNT];
+
+    /* Last values observed in a caller-owned register file. */
+    uint8_t observed_reg[MC6845_REG_COUNT];
+    bool    observed_reg_valid;
 
     uint64_t ticks;
     uint64_t frames;

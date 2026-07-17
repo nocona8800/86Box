@@ -14,6 +14,8 @@
  *          Copyright 2008-2020 Sarah Walker.
  *          Copyright 2016-2020 Miran Grca.
  */
+ 
+#include <86box/mem.h>
 #ifndef VIDEO_SVGA_H
 #    define VIDEO_SVGA_H
 

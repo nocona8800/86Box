@@ -256,7 +256,7 @@ cga_recalctimings(cga_t *cga)
     double _dispontime;
     double _dispofftime;
 
-    /* MC6845_PRECISE_V1: precise dot-clock changes are latched by
+    /* Precise-path dot-clock changes are latched by
      * cga_precise_mode_write() on LCLOCK boundaries. */
 
     if (cga->cgamode & CGA_MODE_FLAG_HIGHRES) {
@@ -771,7 +771,7 @@ cga_poll_legacy(void *priv)
 }
 
 
-/* MC6845_PRECISE_V1: retain legacy timing for derivative adapters. */
+/* Retain legacy timing for derivative adapters. */
 void
 cga_poll(void *priv)
 {
@@ -805,7 +805,7 @@ cga_standalone_init(UNUSED(const device_t *info))
 
     cga->vram = calloc(1, DEVICE_VRAM);
 
-    /* MC6845_PRECISE_V1: enable only for the standalone IBM CGA. */
+    /* Enable precise timing only for the standalone IBM CGA. */
     cga_precise_init(cga);
 
     cga_comp_init(cga->revision);

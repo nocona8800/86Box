@@ -28,23 +28,28 @@
 #define PRECISE_MAX_Y     1024
 
 /*
- * The monitor raster is not resized by CRTC programming.  Standard CGA has
- * 912 dot clocks and 262 scanlines per frame; the 80-dot HSYNC interval is not
- * visible, leaving an 832x262 raster window.  Area 5150 deliberately moves and
- * resizes the active display inside this fixed window.
+ * Keep the complete 912-dot signal period in the monitor raster and anchor X=0
+ * to the accepted HSYNC rising edge.  With standard IBM CGA programming, both
+ * 40- and 80-column modes then begin active video at X=192:
+ *
+ *   80-column: (R0 - R2 + 1) * 8  = (113 - 90 + 1) * 8  = 192
+ *   40-column: (R0 - R2 + 1) * 16 = (56  - 45 + 1) * 16 = 192
+ *
+ * This removes the mode-dependent 32/112-dot crop origin which caused the
+ * picture to wrap or expose an 80-pixel strip after transient clock changes.
  */
 #define PRECISE_TOTAL_DOTS            912
-#define PRECISE_RASTER_WIDTH          832
+#define PRECISE_RASTER_WIDTH          PRECISE_TOTAL_DOTS
 #define PRECISE_RASTER_HEIGHT         262
-#define PRECISE_VISIBLE_WIDTH_HIRES   832
-#define PRECISE_VISIBLE_WIDTH_LORES   752
-#define PRECISE_ACTIVE_X_HIRES        112
-#define PRECISE_ACTIVE_X_LORES        32
+#define PRECISE_ACTIVE_X              192
 #define PRECISE_ACTIVE_Y              38
 #define PRECISE_ACTIVE_WIDTH          640
 #define PRECISE_ACTIVE_HEIGHT         200
 #define PRECISE_MONITOR_VSYNC_MIN_Y   127
 #define PRECISE_CARD_VSYNC_LINES      3
+#define PRECISE_HSYNC_WINDOW_DIVISOR  8
+#define PRECISE_HSYNC_RELOCK_LINES     4
+#define PRECISE_HSYNC_RELOCK_MIN_TOL   16
 
 static int
 cga_precise_buffer_width(void)
@@ -79,21 +84,26 @@ cga_precise_raster_height(const cga_t *cga)
     return (height < PRECISE_RASTER_HEIGHT) ? height : PRECISE_RASTER_HEIGHT;
 }
 
+static void cga_precise_reset_hsync_candidate(cga_t *cga);
+
 static int
 cga_precise_mode_is_graphics(uint8_t mode)
 {
-    /* The undocumented GRAPHICS+80-column combination remains on the text
-     * data path.  This matches the CGA glue logic used by Area 5150. */
-    return (mode & CGA_MODE_FLAG_GRAPHICS) && !(mode & CGA_MODE_FLAG_HIGHRES);
+    /* GRAPHICS+80-column remains on the text data path on IBM CGA. */
+    return (mode & CGA_MODE_FLAG_GRAPHICS) &&
+           !(mode & CGA_MODE_FLAG_HIGHRES);
 }
 
 static void
 cga_precise_request_clock(cga_t *cga)
 {
-    const uint8_t want_high = !!(cga->precise_mode & CGA_MODE_FLAG_HIGHRES);
+    const uint8_t want_high =
+        !!(cga->precise_mode & CGA_MODE_FLAG_HIGHRES);
 
-    if (want_high != cga->precise_clock_high)
+    if (want_high != cga->precise_clock_high) {
         cga->precise_clock_pending = 1;
+        cga_precise_reset_hsync_candidate(cga);
+    }
 }
 
 static void
@@ -110,33 +120,36 @@ cga_precise_apply_pending_mode(cga_t *cga)
 static void
 cga_precise_apply_clock_if_due(cga_t *cga)
 {
-    if (!cga->precise_clock_pending || (cga->precise_master_phase & 0x0f))
+    if (!cga->precise_clock_pending ||
+        (cga->precise_master_phase & 0x0f))
         return;
 
-    cga->precise_clock_high = !!(cga->precise_mode & CGA_MODE_FLAG_HIGHRES);
-    cga->precise_char_time = cga->precise_clock_high ? CGACONST : (CGACONST << 1);
+    cga->precise_clock_high =
+        !!(cga->precise_mode & CGA_MODE_FLAG_HIGHRES);
+    cga->precise_char_time = cga->precise_clock_high ?
+                             CGACONST : (CGACONST << 1);
     cga->precise_clock_pending = 0;
 }
 
 void
 cga_precise_mode_write(cga_t *cga, uint8_t mode)
 {
-    const int old_graphics = cga_precise_mode_is_graphics(cga->precise_mode);
+    const uint8_t mux_mask =
+        CGA_MODE_FLAG_HIGHRES | CGA_MODE_FLAG_GRAPHICS;
+    const int old_graphics =
+        cga_precise_mode_is_graphics(cga->precise_mode);
     const int new_graphics = cga_precise_mode_is_graphics(mode);
 
-    /* The text/graphics mux is latched at horizontal sync.  Applying it at the
-     * CPU OUT callback caused Tetra3d's graphics window to switch partway
-     * through the wrong physical line.  Other bits, including -VIDEO and
-     * palette interpretation, remain live. */
+    /* The text/graphics mux is latched at HSYNC.  Non-mux bits remain live. */
     if (old_graphics != new_graphics) {
         cga->precise_pending_mode = mode;
         cga->precise_mode_pending = 1;
+        cga->precise_mode = (cga->precise_mode & mux_mask) |
+                            (mode & (uint8_t) ~mux_mask);
         return;
     }
 
-    /* A later write supersedes any deferred transition that has not yet
-     * reached HSYNC.  Without this, a text->graphics->text sequence inside
-     * one line can resurrect the stale graphics request at the next sync. */
+    /* A later write supersedes a deferred transition which has not latched. */
     cga->precise_mode_pending = 0;
     cga->precise_mode = mode;
     cga->precise_pending_mode = mode;
@@ -149,58 +162,113 @@ cga_precise_char_pixels(const cga_t *cga)
     return cga->precise_clock_high ? 8 : 16;
 }
 
-/*
- * Beam X is measured from the falling edge of HSYNC.  Standard 80-column
- * timing leaves fourteen 8-dot character clocks before HCC wraps to zero,
- * so display enable begins at X=112.  Standard 40-column timing leaves only
- * two 16-dot character clocks, so display enable begins at X=32.
- *
- * These are fixed monitor apertures for the two CGA dot-clock modes.  They are
- * deliberately not recomputed from live R0/R2/R3 values: raster tricks must be
- * allowed to move through the viewport instead of being recentered by it.
- */
-static int
-cga_precise_active_x_for_clock(int high_clock)
-{
-    return high_clock ? PRECISE_ACTIVE_X_HIRES : PRECISE_ACTIVE_X_LORES;
-}
-
-static int
-cga_precise_visible_width(const cga_t *cga)
-{
-    return cga->precise_clock_high ? PRECISE_VISIBLE_WIDTH_HIRES : PRECISE_VISIBLE_WIDTH_LORES;
-}
-
 static int
 cga_precise_frame_geometry_plausible(const cga_t *cga)
 {
     const int char_pixels = cga_precise_char_pixels(cga);
-    const int total_dots = ((int) cga->crtc[MC6845_R0_HTOTAL] + 1) * char_pixels;
-    const int total_lines = (((int) cga->crtc[MC6845_R4_VTOTAL] + 1) *
-                             ((int) cga->crtc[MC6845_R9_MAX_RASTER] + 1)) +
-                            (int) cga->crtc[MC6845_R5_VTOTAL_ADJUST];
-    const int displayed_dots = (int) cga->crtc[MC6845_R1_HDISPLAYED] * char_pixels;
-    const int displayed_lines = (int) cga->crtc[MC6845_R6_VDISPLAYED] *
-                                ((int) cga->crtc[MC6845_R9_MAX_RASTER] + 1);
+    const int total_dots =
+        ((int) cga->crtc[MC6845_R0_HTOTAL] + 1) * char_pixels;
+    const int total_lines =
+        (((int) cga->crtc[MC6845_R4_VTOTAL] + 1) *
+         ((int) cga->crtc[MC6845_R9_MAX_RASTER] + 1)) +
+        (int) cga->crtc[MC6845_R5_VTOTAL_ADJUST];
+    const int displayed_dots =
+        (int) cga->crtc[MC6845_R1_HDISPLAYED] * char_pixels;
+    const int displayed_lines =
+        (int) cga->crtc[MC6845_R6_VDISPLAYED] *
+        ((int) cga->crtc[MC6845_R9_MAX_RASTER] + 1);
 
-    /* A real monitor lock is acquired only from a full-size CGA-like frame.
-     * Area 5150's one-character auxiliary frames therefore cannot become the
-     * physical monitor frame boundary, no matter how long their raw VSYNC pin
-     * happens to remain asserted. */
     return (total_dots >= 880) && (total_dots <= 960) &&
            (total_lines >= 240) && (total_lines <= 280) &&
            (displayed_dots >= 600) && (displayed_dots <= 768) &&
            (displayed_lines >= 190) && (displayed_lines <= 208);
 }
 
-static int
-cga_precise_hblank_width(const cga_t *cga)
+static void
+cga_precise_reset_hsync_candidate(cga_t *cga)
 {
-    unsigned chars = cga->crtc[MC6845_R3_SYNC_WIDTH] & 0x0f;
+    cga->precise_hsync_candidate_x = -1;
+    cga->precise_hsync_candidate_count = 0;
+}
 
-    if (!chars)
-        chars = 16;
-    return (int) chars * cga_precise_char_pixels(cga);
+static int
+cga_precise_hsync_phase_distance(int a, int b)
+{
+    int distance = a - b;
+
+    if (distance < 0)
+        distance = -distance;
+    if (distance > (PRECISE_TOTAL_DOTS >> 1))
+        distance = PRECISE_TOTAL_DOTS - distance;
+    return distance;
+}
+
+static int
+cga_precise_hsync_qualifies(cga_t *cga)
+{
+    int window;
+    int earliest;
+    int tolerance;
+    const int active_end = PRECISE_ACTIVE_X + PRECISE_ACTIVE_WIDTH;
+
+    /*
+     * Never lock the monitor to one-character auxiliary CRTC frames.  The
+     * geometry test is deliberately applied to both initial acquisition and
+     * re-acquisition.
+     */
+    if (!cga_precise_frame_geometry_plausible(cga)) {
+        cga_precise_reset_hsync_candidate(cga);
+        return 0;
+    }
+
+    if (!cga->precise_monitor_locked) {
+        cga_precise_reset_hsync_candidate(cga);
+        return 1;
+    }
+
+    window = PRECISE_TOTAL_DOTS / PRECISE_HSYNC_WINDOW_DIVISOR;
+    if (window < (cga_precise_char_pixels(cga) << 1))
+        window = cga_precise_char_pixels(cga) << 1;
+
+    earliest = PRECISE_TOTAL_DOTS - window;
+    if (earliest < active_end)
+        earliest = active_end;
+
+    if ((cga->precise_beam_x >= earliest) &&
+        (cga->precise_beam_x <= PRECISE_TOTAL_DOTS + window)) {
+        cga_precise_reset_hsync_candidate(cga);
+        return 1;
+    }
+
+    /*
+     * A 40/80-column transition can move the raw HSYNC edge hundreds of dots
+     * away from the monitor's old phase while retaining the correct 912-dot
+     * period.  The old code rejected that edge forever, leaving a stable
+     * half-screen wrap.  A real horizontal-hold loop instead re-acquires a
+     * persistent off-phase pulse.  Require the same off-phase edge for several
+     * complete CGA-like lines before moving the raster origin; brief demo
+     * pulses therefore remain ignored.
+     */
+    tolerance = cga_precise_char_pixels(cga) << 1;
+    if (tolerance < PRECISE_HSYNC_RELOCK_MIN_TOL)
+        tolerance = PRECISE_HSYNC_RELOCK_MIN_TOL;
+
+    if ((cga->precise_hsync_candidate_x >= 0) &&
+        (cga_precise_hsync_phase_distance(cga->precise_beam_x,
+                                          cga->precise_hsync_candidate_x) <= tolerance)) {
+        if (cga->precise_hsync_candidate_count < 255)
+            cga->precise_hsync_candidate_count++;
+    } else {
+        cga->precise_hsync_candidate_x = cga->precise_beam_x;
+        cga->precise_hsync_candidate_count = 1;
+    }
+
+    if (cga->precise_hsync_candidate_count >= PRECISE_HSYNC_RELOCK_LINES) {
+        cga_precise_reset_hsync_candidate(cga);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int
@@ -267,6 +335,9 @@ cga_precise_note_active(cga_t *cga, int x, int y, int width)
     if (right > buffer_width)
         right = buffer_width;
 
+    if (cga->precise_active_min_y == PRECISE_MAX_Y)
+        cga->precise_frame_hires = cga->precise_clock_high;
+
     if (x < cga->precise_active_min_x)
         cga->precise_active_min_x = x;
     if (right > cga->precise_active_max_x)
@@ -295,6 +366,13 @@ cga_precise_render_cell(cga_t *cga, const mc6845_outputs_t *out)
         (x < 0) || (x >= cga_precise_raster_width()) ||
         (y < 0) || (y >= cga_precise_raster_height(cga)))
         return;
+
+    /* Rejected/raw sync pulses still blank video, but they do not alter
+     * monitor phase.  The three-line CGA-gated VSYNC is blank, not overscan. */
+    if (out->hsync || cga->precise_card_vsync) {
+        cga_precise_fill_cell(cga, x, y, width, 0);
+        return;
+    }
 
     if (!out->de) {
         cga_precise_fill_cell(cga, x, y, width, border);
@@ -405,7 +483,8 @@ cga_precise_render_cell(cga_t *cga, const mc6845_outputs_t *out)
 }
 
 static void
-cga_precise_process_physical_line(cga_t *cga, int physical_y, int drawn_width)
+cga_precise_process_physical_line(cga_t *cga, int physical_y,
+                                  int drawn_width)
 {
     const int width = cga_precise_raster_width();
     const int physical_height = cga_precise_raster_height(cga);
@@ -423,21 +502,24 @@ cga_precise_process_physical_line(cga_t *cga, int physical_y, int drawn_width)
     if (drawn_width > width)
         drawn_width = width;
 
-    /* A monitor has a fixed raster.  If HSYNC arrives early, the remainder of
-     * the line is border rather than stale pixels from the previous frame. */
+    /* Pixels which were never scanned are retrace blank, never fabricated
+     * overscan.  This removes the random right-edge border on early sync. */
     if (drawn_width < width)
-        cga_precise_fill_cell(cga, drawn_width, physical_y, width - drawn_width,
-                              cga_precise_border(cga));
+        cga_precise_fill_cell(cga, drawn_width, physical_y,
+                              width - drawn_width, 0);
 
     if (cga->composite)
-        Composite_Process(cga->precise_mode, border, (width + 3) >> 2, buffer32->line[y]);
+        Composite_Process(cga->precise_mode, border,
+                          (width + 3) >> 2, buffer32->line[y]);
     else
         video_process_8(width, y);
 
     if (cga->double_type == PRECISE_DOUBLE_SIMPLE) {
         if ((y + 1) < buffer_height) {
             if (cga->composite)
-                Composite_Process(cga->precise_mode, border, (width + 3) >> 2, buffer32->line[y + 1]);
+                Composite_Process(cga->precise_mode, border,
+                                  (width + 3) >> 2,
+                                  buffer32->line[y + 1]);
             else
                 video_process_8(width, y + 1);
         }
@@ -459,30 +541,18 @@ cga_precise_process_line(cga_t *cga)
 }
 
 static void
-cga_precise_reset_frame_bounds(cga_t *cga, int keep_horizontal_phase)
+cga_precise_reset_frame_tracking(cga_t *cga)
 {
-    const int saved_x = cga->precise_beam_x;
-
-    if (!keep_horizontal_phase)
-        cga->precise_beam_x = 0;
-    cga->precise_beam_y = 0;
     cga->precise_max_x = 0;
     cga->precise_max_y = 0;
     cga->precise_active_min_x = PRECISE_MAX_X;
     cga->precise_active_min_y = PRECISE_MAX_Y;
     cga->precise_active_max_x = 0;
     cga->precise_active_max_y = 0;
-    cga->precise_frame_hires = !!(cga->precise_mode & CGA_MODE_FLAG_HIGHRES);
-
-    /* A qualified VSYNC can begin partway through a physical scanline.  Keep
-     * horizontal phase and blank the prefix of the new frame instead of
-     * snapping the beam back to X=0. */
-    if (keep_horizontal_phase && !cga->precise_monitor_hblank && (saved_x > 0))
-        cga_precise_fill_cell(cga, 0, 0, saved_x, cga_precise_border(cga));
 }
 
 static void
-cga_precise_present_frame(cga_t *cga, int keep_horizontal_phase)
+cga_precise_present_frame(cga_t *cga)
 {
     int src_x;
     int src_y;
@@ -496,32 +566,29 @@ cga_precise_present_frame(cga_t *cga, int keep_horizontal_phase)
     if ((raster_width <= 0) || (raster_height <= 0) ||
         (buffer_width <= 0) || (buffer_height <= 0)) {
         cga->precise_frame_valid = 0;
-        cga_precise_reset_frame_bounds(cga, keep_horizontal_phase);
+        cga_precise_reset_frame_tracking(cga);
         return;
     }
 
-    if ((cga->precise_beam_x > 0) && !cga->precise_monitor_hblank)
-        cga_precise_process_line(cga);
-
-    /* Complete every unwritten monitor line with border.  Internal CRTC frames
-     * and malformed sync pulses must never expose stale pixels from the prior
-     * physical monitor frame. */
-    for (int y = cga->precise_max_y; y < raster_height; y++)
-        cga_precise_process_physical_line(cga, y, 0);
+    /* A qualified frame boundary is always committed at a physical line
+     * boundary.  Complete only genuinely unscanned lines, using retrace black. */
+    for (int line = cga->precise_max_y; line < raster_height; line++) {
+        cga_precise_fill_cell(cga, 0, line, raster_width, 0);
+        cga_precise_process_physical_line(cga, line, raster_width);
+    }
 
     if (enable_overscan) {
-        src_x = 0;
+        /*
+         * Present a fixed 832-dot monitor aperture.  Keeping this independent
+         * of the current character clock prevents a transient 40-column mode
+         * from moving the host crop by 80 pixels.
+         */
+        src_x = PRECISE_TOTAL_DOTS - 832;
         src_y = 0;
-        /* Keep the host canvas fixed even when the dot clock changes inside a
-         * frame.  Low-clock lines simply contain more right-hand border. */
-        width = raster_width;
+        width = 832;
         height = raster_height;
     } else {
-        /* The monitor aperture is fixed in signal coordinates.  It must not
-         * follow display-enable bounds or the currently active internal CRTC
-         * frame; doing so turns vertical motion into scaling and lets tiny
-         * auxiliary frames recenter the host image. */
-        src_x = cga_precise_active_x_for_clock(cga->precise_frame_hires);
+        src_x = PRECISE_ACTIVE_X;
         src_y = PRECISE_ACTIVE_Y;
         width = PRECISE_ACTIVE_WIDTH;
         height = PRECISE_ACTIVE_HEIGHT;
@@ -547,15 +614,16 @@ cga_precise_present_frame(cga_t *cga, int keep_horizontal_phase)
         src_y = 0;
     if (src_x >= buffer_width)
         width = 0;
-    else if (width > (buffer_width - src_x))
+    else if (width > buffer_width - src_x)
         width = buffer_width - src_x;
     if (src_y >= buffer_height)
         height = 0;
-    else if (height > (buffer_height - src_y))
+    else if (height > buffer_height - src_y)
         height = buffer_height - src_y;
 
     if ((width > 0) && (height > 0) && cga->precise_frame_valid) {
-        if ((width != xsize) || (height != ysize) || video_force_resize_get()) {
+        if ((width != xsize) || (height != ysize) ||
+            video_force_resize_get()) {
             xsize = width;
             ysize = height;
             set_screen_size(xsize, ysize);
@@ -564,7 +632,8 @@ cga_precise_present_frame(cga_t *cga, int keep_horizontal_phase)
 
         video_wait_for_buffer();
         if (cga->double_type > PRECISE_DOUBLE_SIMPLE)
-            cga_blit_memtoscreen(src_x, src_y, width, height, cga->double_type);
+            cga_blit_memtoscreen(src_x, src_y, width, height,
+                                 cga->double_type);
         else
             video_blit_memtoscreen(src_x, src_y, width, height);
 
@@ -572,52 +641,72 @@ cga_precise_present_frame(cga_t *cga, int keep_horizontal_phase)
         video_res_x = width;
         video_res_y = height;
         video_bpp = (cga->precise_mode & CGA_MODE_FLAG_GRAPHICS) ?
-                    ((cga->precise_mode & CGA_MODE_FLAG_HIGHRES_GRAPHICS) ? 1 : 2) : 0;
+                    ((cga->precise_mode &
+                      CGA_MODE_FLAG_HIGHRES_GRAPHICS) ? 1 : 2) : 0;
     }
 
     cga->precise_frame_valid = 1;
     cga->cgablink++;
     cga->oddeven ^= 1;
-    cga_precise_reset_frame_bounds(cga, keep_horizontal_phase);
+    cga_precise_reset_frame_tracking(cga);
 }
 
+/* Perform vertical flyback at the accepted VSYNC phase.  Horizontal
+ * deflection continues, so X is preserved instead of being snapped to zero. */
 static void
-cga_precise_start_monitor_hblank(cga_t *cga, int from_hsync)
+cga_precise_vertical_flyback(cga_t *cga)
 {
-    int target;
+    const int raster_width = cga_precise_raster_width();
+    const int raster_height = cga_precise_raster_height(cga);
+    int phase = cga->precise_beam_x;
+    int old_y = cga->precise_beam_y;
 
-    if (cga->precise_monitor_hblank)
+    if ((raster_width <= 0) || (raster_height <= 0))
         return;
 
-    cga_precise_process_line(cga);
-    cga->precise_monitor_hblank = 1;
-    cga->precise_hblank_pixels = 0;
+    if (phase < 0)
+        phase = 0;
+    if (phase > raster_width)
+        phase = raster_width;
+    if (old_y < 0)
+        old_y = 0;
+    if (old_y >= raster_height)
+        old_y = raster_height - 1;
 
-    if (from_hsync)
-        target = cga_precise_hblank_width(cga);
-    else
-        target = PRECISE_TOTAL_DOTS - cga_precise_visible_width(cga);
+    /*
+     * If VSYNC begins between horizontal boundaries, commit the scanned prefix
+     * of the old field.  If an accepted HSYNC edge has just reset X to zero,
+     * there is no new line content to commit.
+     */
+    if (phase > 0)
+        cga_precise_process_physical_line(cga, old_y, phase);
 
-    if (target < cga_precise_char_pixels(cga))
-        target = cga_precise_char_pixels(cga);
-    if (target > PRECISE_RASTER_WIDTH)
-        target = PRECISE_RASTER_WIDTH;
-    cga->precise_hblank_target = target;
+    cga_precise_present_frame(cga);
+
+    cga->precise_beam_y = 0;
+    cga->precise_beam_x = phase;
+    cga->displine = 0;
+
+    /* The new field begins at the same horizontal phase. */
+    if (phase > 0)
+        cga_precise_fill_cell(cga, 0, 0, phase, 0);
 }
 
+/*
+ * Commit one physical monitor line.  Horizontal phase is anchored to the
+ * accepted HSYNC rising edge, not to the falling edge or programmed pulse
+ * width.  That gives both standard CGA dot-clock modes the same active origin.
+ */
 static void
 cga_precise_finish_monitor_line(cga_t *cga)
 {
-    const int acquire_lock = cga->precise_sync_pending &&
-                             !cga->precise_monitor_locked &&
-                             cga_precise_frame_geometry_plausible(cga);
+    cga_precise_process_line(cga);
 
-    cga->precise_monitor_hblank = 0;
-    cga->precise_hblank_pixels = 0;
-    cga->precise_hblank_target = 0;
     cga->precise_beam_x = 0;
     cga->precise_beam_y++;
     cga->displine = cga->precise_beam_y;
+    cga->precise_hblank_pixels = 0;
+    cga->precise_hblank_target = 0;
 
     if (cga->precise_card_vsync) {
         if (cga->precise_card_vsync_lines < 255)
@@ -628,22 +717,11 @@ cga_precise_finish_monitor_line(cga_t *cga)
         }
     }
 
-    /* Acquire monitor phase once, from a complete CGA-like frame, one physical
-     * line after the CRTC VSYNC edge.  Once locked, the monitor free-runs at
-     * 262 lines and ignores later internal CRTC frames.  CPU/video clocks are
-     * derived from the same crystal, so continuously snapping to raw VSYNC is
-     * both unnecessary and destructive. */
-    if (acquire_lock) {
-        cga->precise_monitor_locked = 1;
-        cga->precise_sync_pending = 0;
-        cga_precise_present_frame(cga, 0);
-        return;
+    if (cga->precise_beam_y >= PRECISE_RASTER_HEIGHT) {
+        cga_precise_present_frame(cga);
+        cga->precise_beam_y = 0;
+        cga->displine = 0;
     }
-
-    /* A monitor eventually flies back even if the CRTC fails to provide a
-     * usable VSYNC.  This is also the normal frame boundary after lock. */
-    if (cga->precise_beam_y >= PRECISE_RASTER_HEIGHT)
-        cga_precise_present_frame(cga, 0);
 }
 
 void
@@ -654,24 +732,29 @@ cga_precise_init(cga_t *cga)
     cga->precise_mode = cga->cgamode;
     cga->precise_pending_mode = cga->cgamode;
     cga->precise_mode_pending = 0;
-    cga->precise_clock_high = !!(cga->cgamode & CGA_MODE_FLAG_HIGHRES);
+    cga->precise_clock_high =
+        !!(cga->cgamode & CGA_MODE_FLAG_HIGHRES);
     cga->precise_clock_pending = 0;
     cga->precise_master_phase = 0;
-    cga->precise_char_time = cga->precise_clock_high ? CGACONST : (CGACONST << 1);
+    cga->precise_char_time = cga->precise_clock_high ?
+                             CGACONST : (CGACONST << 1);
     cga->precise_beam_x = 0;
+    cga->precise_beam_y = 0;
     cga->precise_prev_hsync = 0;
     cga->precise_prev_vsync = 0;
     cga->precise_frame_valid = 0;
-    cga->precise_monitor_hblank = 0;
-    cga->precise_monitor_vsync = 0;
-    cga->precise_monitor_locked = 0;
-    cga->precise_sync_pending = 0;
-    cga->precise_card_vsync = 0;
-    cga->precise_card_vsync_lines = 0;
     cga->precise_hblank_pixels = 0;
     cga->precise_hblank_target = 0;
     cga->precise_vsync_dots = 0;
-    cga_precise_reset_frame_bounds(cga, 0);
+    cga->precise_monitor_hblank = 0;
+    cga->precise_monitor_vsync = 0;
+    cga->precise_frame_hires = cga->precise_clock_high;
+    cga->precise_monitor_locked = 0;
+    cga_precise_reset_hsync_candidate(cga);
+    cga->precise_sync_pending = 0;
+    cga->precise_card_vsync = 0;
+    cga->precise_card_vsync_lines = 0;
+    cga_precise_reset_frame_tracking(cga);
 }
 
 void
@@ -682,17 +765,15 @@ cga_poll_precise(void *priv)
     mc6845_outputs_t after;
     uint64_t char_time;
     int cell_width;
-    int visible_limit;
-    int was_hblank;
+    int line_finished = 0;
 
     cga_precise_apply_clock_if_due(cga);
     char_time = cga->precise_char_time;
     cell_width = cga_precise_char_pixels(cga);
-    visible_limit = cga_precise_visible_width(cga);
-    was_hblank = cga->precise_monitor_hblank;
 
     if (!char_time)
-        char_time = cga->precise_clock_high ? CGACONST : (CGACONST << 1);
+        char_time = cga->precise_clock_high ?
+                    CGACONST : (CGACONST << 1);
     timer_advance_u64(&cga->timer, char_time);
 
     mc6845_core_get_outputs(&cga->precise_crtc, &before);
@@ -701,20 +782,23 @@ cga_poll_precise(void *priv)
         cga->cgastat &= ~1;
     else
         cga->cgastat |= 1;
-    if (before.vsync)
+    if (cga->precise_card_vsync)
         cga->cgastat |= 8;
     else
         cga->cgastat &= ~8;
 
-    if (was_hblank) {
-        if (cga->precise_hblank_pixels <= PRECISE_MAX_X - cell_width)
-            cga->precise_hblank_pixels += cell_width;
-    } else {
+    /*
+     * Draw every character clock in the complete 912-dot signal period.
+     * HSYNC and the CGA-gated VSYNC are explicitly black in render_cell();
+     * they still consume horizontal phase and therefore cannot compress or
+     * offset the following active display.
+     */
+    {
         const int beam_limit = cga_precise_raster_width();
 
         if ((beam_limit > 0) && (cga->precise_beam_x < beam_limit)) {
             cga_precise_render_cell(cga, &before);
-            if (cell_width >= (beam_limit - cga->precise_beam_x))
+            if (cell_width >= beam_limit - cga->precise_beam_x)
                 cga->precise_beam_x = beam_limit;
             else
                 cga->precise_beam_x += cell_width;
@@ -724,21 +808,54 @@ cga_poll_precise(void *priv)
     mc6845_core_tick(&cga->precise_crtc);
     mc6845_core_get_outputs(&cga->precise_crtc, &after);
 
-    /* The CGA card gates the 6845's sixteen-line VSYNC to roughly three
-     * physical scanlines.  More importantly, only the first plausible full
-     * frame is allowed to acquire monitor phase; later raw VSYNC edges are not
-     * host-frame boundaries. */
+    /*
+     * Horizontal monitor phase is taken from the HSYNC leading edge.  Apply
+     * the card's mode-mux latch at every raw edge, but reset the physical beam
+     * only when the edge is in the monitor acceptance window.
+     */
+    if (!before.hsync && after.hsync) {
+        cga_precise_apply_pending_mode(cga);
+
+        if (cga_precise_hsync_qualifies(cga)) {
+            cga->precise_monitor_locked = 1;
+            cga->precise_monitor_hblank = 1;
+            cga_precise_finish_monitor_line(cga);
+            line_finished = 1;
+        }
+    } else if (before.hsync && !after.hsync) {
+        cga->precise_monitor_hblank = 0;
+    }
+
+    /*
+     * Missing or rejected HSYNC cannot stall the raster.  The oscillator
+     * free-runs at 912 master dots.  Do this after edge handling so a valid
+     * edge at the expected phase cannot finish the same line twice.
+     */
+    if (!line_finished && (cga->precise_beam_x >= PRECISE_TOTAL_DOTS)) {
+        cga->precise_monitor_hblank = 0;
+        cga_precise_finish_monitor_line(cga);
+        line_finished = 1;
+    }
+
+    /*
+     * Handle VSYNC after horizontal edge processing.  Coincident H/V edges
+     * therefore commit the old scanline first and start the new field at X=0,
+     * while a midline VSYNC preserves its genuine horizontal phase.
+     */
     if (!before.vsync && after.vsync) {
         cga->precise_card_vsync = 1;
         cga->precise_card_vsync_lines = 0;
         cga->precise_monitor_vsync = 1;
-        if (!cga->precise_monitor_locked &&
-            cga_precise_frame_geometry_plausible(cga))
-            cga->precise_sync_pending = 1;
+
+        if ((cga->precise_beam_y >= PRECISE_MONITOR_VSYNC_MIN_Y) &&
+            (cga->precise_monitor_locked ||
+             cga_precise_frame_geometry_plausible(cga))) {
+            cga->precise_monitor_locked = 1;
+            cga->precise_sync_pending = 0;
+            cga_precise_vertical_flyback(cga);
+        }
     } else if (before.vsync && !after.vsync) {
         cga->precise_monitor_vsync = 0;
-        if (!cga->precise_monitor_locked)
-            cga->precise_sync_pending = 0;
     }
 
     /* Keep legacy debugger-visible fields coherent. */
@@ -749,22 +866,8 @@ cga_poll_precise(void *priv)
     cga->cgadispon = after.de;
     cga->cursorvisible = after.cursor;
 
-    /* Raw CRTC HSYNC starts monitor flyback, but monitor flyback has its own
-     * duration and fallback.  Missing or malformed HSYNC can no longer freeze
-     * the physical scanline counter. */
-    if (!before.hsync && after.hsync) {
-        cga_precise_apply_pending_mode(cga);
-        cga_precise_start_monitor_hblank(cga, 1);
-    }
-    else if (!cga->precise_monitor_hblank &&
-             (cga->precise_beam_x >= visible_limit))
-        cga_precise_start_monitor_hblank(cga, 0);
-
-    if (was_hblank && cga->precise_monitor_hblank &&
-        (cga->precise_hblank_pixels >= cga->precise_hblank_target))
-        cga_precise_finish_monitor_line(cga);
-
-    cga->precise_master_phase = (cga->precise_master_phase + (uint32_t) cell_width) & 0x0f;
+    cga->precise_master_phase =
+        (cga->precise_master_phase + (uint32_t) cell_width) & 0x0f;
     cga->precise_prev_hsync = after.hsync;
     cga->precise_prev_vsync = after.vsync;
 }

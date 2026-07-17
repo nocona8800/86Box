@@ -19,6 +19,8 @@ add_library(vid OBJECT
     # Video Core
     agpgart.c
     video.c
+    crt86/crt_emulator.c
+    crt86/crt86box.c
     vid_table.c
 
     # RAMDAC (Should this be its own library?)
@@ -148,6 +150,17 @@ add_library(vid OBJECT
     # Generic
     vid_bochs_vbe.c
 )
+
+
+# CRT86BOX_ASYNC_CPU: OpenMP is used only inside the dedicated CRT worker.
+# 86BOX_CRT_THREADS controls its team size at runtime; default is at most four.
+option(CRT86_OPENMP "Parallelize the asynchronous CRT worker" ON)
+if(CRT86_OPENMP)
+    find_package(OpenMP QUIET COMPONENTS C)
+    if(OpenMP_C_FOUND)
+        target_link_libraries(vid PUBLIC OpenMP::OpenMP_C)
+    endif()
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     target_include_directories(vid PRIVATE /usr/local/include)
