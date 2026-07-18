@@ -33,6 +33,7 @@
 #include <86box/video.h>
 #include <86box/vid_cga.h>
 #include <86box/vid_cga_comp.h>
+#include "syncpll/syncpll86box.h"
 #include <86box/plat_unused.h>
 
 #define CGA_RGB       0
@@ -98,6 +99,9 @@ cga_out(uint16_t addr, uint8_t val, void *priv)
             return;
         case CGA_REGISTER_CRTC_DATA:
             old = cga->crtc[cga->crtcreg];
+            if (cga->precise_enabled && cga->composite &&
+                cga->crtcreg == CGA_CRTC_HSYNC_WIDTH && old != val)
+                cga_precise_signal_flush(cga);
             if (cga->precise_enabled)
                 mc6845_core_select_write(&cga->precise_crtc, cga->crtcreg, val);
             else
@@ -109,9 +113,13 @@ cga_out(uint16_t addr, uint8_t val, void *priv)
                     cga->fullchange = changeframecount;
                     cga_recalctimings(cga);
 
-                    if (cga->crtcreg == 3)
-                        update_cga16_color(cga->cgamode, (cga->cgacol & 0x0f) |
-                                                         (((cga->crtc[3] == 0) || (cga->crtc[3] == 15)) ? 0x80 : 0x00));
+                    if (cga->crtcreg == 3) {
+                        const uint8_t output_mode = cga->precise_enabled
+                                                  ? cga->precise_mode
+                                                  : cga->cgamode;
+                        update_cga16_color(output_mode, (cga->cgacol & 0x0f) |
+                                                        (((cga->crtc[3] == 0) || (cga->crtc[3] == 15)) ? 0x80 : 0x00));
+                    }
                 }
             }
             return;
@@ -122,19 +130,32 @@ cga_out(uint16_t addr, uint8_t val, void *priv)
                 cga_precise_mode_write(cga, val);
 
             if (old ^ val) {
-                if ((old ^ val) & 0x07)
-                    update_cga16_color(cga->cgamode, (cga->cgacol & 0x0f) |
-                                                     (((cga->crtc[3] == 0) || (cga->crtc[3] == 15)) ? 0x80 : 0x00));
+                /* A precise text/graphics transition latches at HSYNC.  Do
+                 * not rebuild the composite transfer table from the new CPU
+                 * byte until the matching pixel mux state has latched too. */
+                if (((old ^ val) & 0x07) &&
+                    (!cga->precise_enabled || !cga->precise_mode_pending)) {
+                    const uint8_t output_mode = cga->precise_enabled
+                                              ? cga->precise_mode
+                                              : cga->cgamode;
+                    update_cga16_color(output_mode, (cga->cgacol & 0x0f) |
+                                                    (((cga->crtc[3] == 0) || (cga->crtc[3] == 15)) ? 0x80 : 0x00));
+                }
 
                 cga_recalctimings(cga);
             }
             return;
         case CGA_REGISTER_COLOR_SELECT:
-            old         = cga->cgacol;
+            old = cga->cgacol;
+            if (cga->precise_enabled && cga->composite && old != val)
+                cga_precise_signal_flush(cga);
             cga->cgacol = val;
             if (old ^ val) {
-                update_cga16_color(cga->cgamode, (cga->cgacol & 0x0f) |
-                                                 (((cga->crtc[3] == 0) || (cga->crtc[3] == 15)) ? 0x80 : 0x00));
+                const uint8_t output_mode = cga->precise_enabled
+                                          ? cga->precise_mode
+                                          : cga->cgamode;
+                update_cga16_color(output_mode, (cga->cgacol & 0x0f) |
+                                                (((cga->crtc[3] == 0) || (cga->crtc[3] == 15)) ? 0x80 : 0x00));
 
                 cga_recalctimings(cga);
             }
@@ -860,6 +881,10 @@ cga_close(void *priv)
 {
     cga_t *cga = (cga_t *) priv;
 
+    syncpll_cga_stream_reset(monitor_index_global);
+    free(cga->precise_signal_color);
+    free(cga->precise_signal_flags);
+    free(cga->precise_signal_xrgb);
     free(cga->vram);
     free(cga);
 }

@@ -5,12 +5,12 @@
 
 /* Mode flags written through 3D8h. */
 typedef enum cga_mode_flags_e {
-    CGA_MODE_FLAG_HIGHRES         = 1 << 0,
-    CGA_MODE_FLAG_GRAPHICS        = 1 << 1,
-    CGA_MODE_FLAG_BW              = 1 << 2,
-    CGA_MODE_FLAG_VIDEO_ENABLE    = 1 << 3,
+    CGA_MODE_FLAG_HIGHRES          = 1 << 0,
+    CGA_MODE_FLAG_GRAPHICS         = 1 << 1,
+    CGA_MODE_FLAG_BW               = 1 << 2,
+    CGA_MODE_FLAG_VIDEO_ENABLE     = 1 << 3,
     CGA_MODE_FLAG_HIGHRES_GRAPHICS = 1 << 4,
-    CGA_MODE_FLAG_BLINK           = 1 << 5
+    CGA_MODE_FLAG_BLINK            = 1 << 5
 } cga_mode_flags;
 
 /* Motorola MC6845 CRTC registers. */
@@ -92,7 +92,7 @@ typedef struct cga_t {
     int rgb_type;
     int double_type;
 
-    /* Character-clock MC6845 and physical-monitor state. */
+    /* Character-clock MC6845 and legacy physical-monitor state. */
     mc6845_core_t precise_crtc;
     uint64_t precise_char_time;
     int precise_beam_x;
@@ -124,12 +124,33 @@ typedef struct cga_t {
     uint32_t precise_master_phase;
     uint8_t precise_sync_pending;
     uint8_t precise_card_vsync;
-    uint8_t precise_card_vsync_lines;
+
+    /* Flat raw-dot line staging for the monitor sync-PLL CGA signal path. */
+    uint8_t *precise_signal_color;
+    uint8_t *precise_signal_flags;
+    uint32_t *precise_signal_xrgb;
+    uint32_t precise_signal_count;
+    uint32_t precise_signal_capacity;
+    /* IBM CGA monitor-sync shaper.  The MC6845 raw HS/VS outputs are not
+     * the signals delivered to the display connector: HS is delayed by two
+     * LCLKs and limited to four LCLKs, while monitor VS is aligned to shaped
+     * HS and lasts three physical lines.  CRTC VS independently blanks video
+     * for its full sixteen internal scanlines. */
+    uint8_t precise_signal_raw_hsync;
+    uint8_t precise_signal_raw_vsync;
+    uint8_t precise_signal_hsync;
+    uint8_t precise_signal_vsync_gate;
+    uint8_t precise_signal_vsync_armed;
+    uint8_t precise_signal_vsync_lines;
+    uint16_t precise_signal_hsync_delay;
+    uint16_t precise_signal_hsync_width;
+    uint64_t precise_signal_present_dots;
 } cga_t;
 
 extern void cga_precise_init(cga_t *cga);
 extern void cga_poll_precise(void *priv);
 extern void cga_precise_mode_write(cga_t *cga, uint8_t mode);
+extern void cga_precise_signal_flush(cga_t *cga);
 extern void cga_init(cga_t *cga);
 extern void cga_out(uint16_t addr, uint8_t val, void *priv);
 extern uint8_t cga_in(uint16_t addr, void *priv);

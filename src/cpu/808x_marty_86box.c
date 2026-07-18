@@ -321,9 +321,14 @@ static void m808x_host_cycle(void);
  * models while converting any cycle deduction into actual Tw states. */
 #define M808X_HOST_CALLBACK_PHASE_BIAS 2
 static bool m808x_in_host_bus_callback = false;
+/* Host-visible time is advanced to the legacy post-access phase before a
+ * device callback, then the following physical core clocks consume this
+ * credit instead of advancing TSC twice. */
+static unsigned m808x_host_tsc_credit = 0u;
 #ifdef M808X_86BOX_TESTING
 static uint64_t m808x_test_captured_wait_clocks = 0;
 static uint64_t m808x_test_tw_clocks = 0;
+static void (*m808x_test_cycle_hook)(const m808x_cpu_t *cpu) = NULL;
 #endif
 static bool m808x_host_override_vector(uint8_t vector, uint16_t *ip, uint16_t *segp);
 
@@ -383,23 +388,25 @@ static void queue_flush(m808x_pfq_t *q)
     q->op = QOP_FLUSH;
 }
 
-static unsigned fetch_bytes_required(const m808x_cpu_t *cpu)
-{
-    if (!cpu->is_8086) {
-        return 1u;
-    }
-    return (cpu->pc & 1u) ? 1u : 2u;
-}
-
 static bool queue_has_room_for_fetch(const m808x_cpu_t *cpu)
 {
-    const unsigned required = fetch_bytes_required(cpu);
-    return cpu->biu.queue.len + required <= cpu->biu.queue.capacity;
+    /* Reserve the physical fetch width, not merely the number of bytes that
+     * an odd-address 8086 fetch will eventually enqueue. */
+    return cpu->is_8086 ? cpu->biu.queue.len <= 4u
+                        : cpu->biu.queue.len <= 3u;
 }
 
 static bool queue_at_policy_len(const m808x_cpu_t *cpu)
 {
-    return cpu->biu.queue.len >= cpu->biu.queue.policy_len;
+    const m808x_pfq_t *q = &cpu->biu.queue;
+    if (!cpu->is_8086) return q->len == 3u;
+    return q->len == 3u || q->len == 4u;
+}
+
+static bool queue_at_policy_threshold_before_read(const m808x_cpu_t *cpu)
+{
+    (void)cpu;
+    return cpu->biu.queue.len == 3u;
 }
 
 static uint16_t architectural_ip(const m808x_cpu_t *cpu)
@@ -558,13 +565,10 @@ static void biu_make_fetch_decision(m808x_cpu_t *cpu)
     }
 }
 
+
 static void biu_fetch_on_queue_read(m808x_cpu_t *cpu)
 {
     m808x_biu_t *b = &cpu->biu;
-
-    if (b->fetch.kind == FETCH_DELAYED && queue_at_policy_len(cpu)) {
-        b->fetch.delay = 0u;
-    }
 
     if (b->bus_status == BUS_PASSIVE && queue_has_room_for_fetch(cpu)) {
         if (b->fetch.kind == FETCH_SUSPENDED || b->fetch.kind == FETCH_PAUSED_FULL) {
@@ -591,7 +595,18 @@ static void biu_do_bus_transfer(m808x_cpu_t *cpu)
      * budget: the same number of clocks are then emitted below as physical
      * Tw states.  This also catches handlers that call sub_cycles(). */
     const int host_cycles_before = cpu_state._cycles;
+    const uint64_t host_tick = ((uint64_t)xt_cpu_multi >> 32ULL);
     cpu_state._cycles -= M808X_HOST_CALLBACK_PHASE_BIAS;
+
+    /* Legacy 808x.c charged the complete four-clock access before invoking
+     * the device.  Preserve that observable TSC phase without double-counting:
+     * advance now, process due timers, then consume the same number of future
+     * physical core clocks from m808x_host_tsc_credit. */
+    tsc += (uint64_t)M808X_HOST_CALLBACK_PHASE_BIAS * host_tick;
+    m808x_host_tsc_credit += M808X_HOST_CALLBACK_PHASE_BIAS;
+    if (TIMER_VAL_LESS_THAN_VAL(timer_target, (uint64_t)tsc))
+        timer_process();
+
     m808x_in_host_bus_callback = true;
 
     switch (b->bus_status_latch) {
@@ -804,6 +819,8 @@ static void biu_cycle_i(m808x_cpu_t *cpu, uint16_t mc_line, const char *comment)
 #ifdef M808X_86BOX_TESTING
     if (b->t_cycle == T_W)
         m808x_test_tw_clocks++;
+    if (m808x_test_cycle_hook != NULL)
+        m808x_test_cycle_hook(cpu);
 #endif
     trace_cycle(cpu);
 
@@ -1073,8 +1090,19 @@ static uint16_t biu_read_u16(m808x_cpu_t *cpu, m808x_segment_t segment, uint16_t
         return cpu->biu.data_bus;
     }
 
-    const uint8_t lo = biu_read_u8(cpu, segment, offset);
-    const uint8_t hi = biu_read_u8(cpu, segment, (uint16_t)(offset + 1u));
+    /* A word read on the 8088 is one indivisible operand transfer made of
+     * two byte bus cycles.  The first byte is not a final transfer and may
+     * not admit an intervening prefetch. */
+    const uint32_t address0 = segment == SEG_NONE ? offset : linear_address(cpu->segs[segment], offset);
+    biu_bus_begin(cpu, BUS_MEMR, segment, address0, 0u, XFER_BYTE, OPERAND_16, true);
+    biu_bus_wait_finish(cpu);
+    const uint8_t lo = cpu->biu.bhe ? (uint8_t)(cpu->biu.data_bus >> 8) : (uint8_t)cpu->biu.data_bus;
+
+    const uint16_t offset1 = (uint16_t)(offset + 1u);
+    const uint32_t address1 = segment == SEG_NONE ? offset1 : linear_address(cpu->segs[segment], offset1);
+    biu_bus_begin(cpu, BUS_MEMR, segment, address1, 0u, XFER_BYTE, OPERAND_16, false);
+    biu_bus_wait_finish(cpu);
+    const uint8_t hi = cpu->biu.bhe ? (uint8_t)(cpu->biu.data_bus >> 8) : (uint8_t)cpu->biu.data_bus;
     return (uint16_t)(lo | ((uint16_t)hi << 8));
 }
 
@@ -1112,8 +1140,12 @@ static uint16_t biu_io_read_u16(m808x_cpu_t *cpu, uint16_t port)
         return cpu->biu.data_bus;
     }
 
-    const uint8_t lo = biu_io_read_u8(cpu, port);
-    const uint8_t hi = biu_io_read_u8(cpu, (uint16_t)(port + 1u));
+    biu_bus_begin(cpu, BUS_IOR, SEG_NONE, port, 0u, XFER_BYTE, OPERAND_16, true);
+    biu_bus_wait_finish(cpu);
+    const uint8_t lo = (uint8_t)cpu->biu.data_bus;
+    biu_bus_begin(cpu, BUS_IOR, SEG_NONE, (uint16_t)(port + 1u), 0u, XFER_BYTE, OPERAND_16, false);
+    biu_bus_wait_finish(cpu);
+    const uint8_t hi = (uint8_t)cpu->biu.data_bus;
     return (uint16_t)(lo | ((uint16_t)hi << 8));
 }
 
@@ -1195,10 +1227,21 @@ static void biu_bus_wait_halt(m808x_cpu_t *cpu)
     }
 }
 
+static void biu_cancel_fetch_delay_before_queue_read(m808x_cpu_t *cpu)
+{
+    m808x_biu_t *b = &cpu->biu;
+    if (b->fetch.kind == FETCH_DELAYED && queue_at_policy_threshold_before_read(cpu))
+        b->fetch.delay = 0u;
+}
+
 static uint8_t queue_read(m808x_cpu_t *cpu, bool first)
 {
     m808x_pfq_t *q = &cpu->biu.queue;
     uint8_t value;
+    const bool was_empty = !q->preload_valid && q->len == 0u;
+
+    /* Delay cancellation is evaluated from the pre-read queue length. */
+    biu_cancel_fetch_delay_before_queue_read(cpu);
 
     if (q->preload_valid) {
         value = q->preload_byte;
@@ -1220,7 +1263,9 @@ static uint8_t queue_read(m808x_cpu_t *cpu, bool first)
     value = queue_pop(q);
     q->op = first ? QOP_FIRST : QOP_SUBSEQUENT;
     q->was_read = value;
-    biu_fetch_on_queue_read(cpu);
+    /* If this read had to wait for an empty queue, the hardware does not
+     * immediately issue FOQR again after consuming the just-fetched byte. */
+    if (!was_empty) biu_fetch_on_queue_read(cpu);
     biu_cycle(cpu);
     return value;
 }
@@ -1452,7 +1497,7 @@ static bool decode_instruction(m808x_cpu_t *cpu)
     uint8_t opcode = queue_read(cpu, true);
     while (decode_prefix(cpu, opcode)) {
         biu_cycle_i(cpu, MC_NONE, "PREFIX");
-        opcode = queue_read(cpu, false);
+        opcode = queue_read(cpu, true);
     }
     cpu->ins.opcode = opcode;
 
@@ -1652,13 +1697,24 @@ static bool rm_is_memory(const m808x_cpu_t *cpu)
     return cpu->ins.has_modrm && cpu->ins.mod != 3u;
 }
 
+static void ea_load_return(m808x_cpu_t *cpu)
+{
+    CYCLES_MC(cpu, 0x1e2u, MC_JUMP);
+}
+
+static void ea_done_return(m808x_cpu_t *cpu)
+{
+    CYCLES_MC(cpu, 0x1e3u, MC_JUMP);
+}
+
 static uint16_t read_rm(m808x_cpu_t *cpu, bool word)
 {
-    if (!rm_is_memory(cpu)) {
+    if (!rm_is_memory(cpu))
         return word ? get_reg16(cpu, cpu->ins.rm) : get_reg8(cpu, cpu->ins.rm);
-    }
-    return word ? biu_read_u16(cpu, cpu->ins.ea_segment, cpu->ins.ea)
-                : biu_read_u8(cpu, cpu->ins.ea_segment, cpu->ins.ea);
+    const uint16_t value = word ? biu_read_u16(cpu, cpu->ins.ea_segment, cpu->ins.ea)
+                                : biu_read_u8(cpu, cpu->ins.ea_segment, cpu->ins.ea);
+    ea_load_return(cpu);
+    return value;
 }
 
 static void write_rm(m808x_cpu_t *cpu, bool word, uint16_t value)
@@ -1769,16 +1825,6 @@ static void pop_flags(m808x_cpu_t *cpu)
     }
 }
 
-static uint16_t read_far_offset(m808x_cpu_t *cpu)
-{
-    return biu_read_u16(cpu, cpu->ins.ea_segment, cpu->ins.ea);
-}
-
-static uint16_t read_far_segment(m808x_cpu_t *cpu)
-{
-    return biu_read_u16(cpu, cpu->ins.ea_segment, (uint16_t)(cpu->ins.ea + 2u));
-}
-
 static void nearcall(m808x_cpu_t *cpu, uint16_t new_ip)
 {
     const uint16_t return_ip = cpu->pc;
@@ -1861,91 +1907,167 @@ static uint16_t shift_rotate(m808x_cpu_t *cpu, unsigned operation, uint16_t valu
 {
     const uint16_t mask = word ? 0xffffu : 0x00ffu;
     const uint16_t sign = word ? 0x8000u : 0x0080u;
-    const unsigned bits = word ? 16u : 8u;
+    const unsigned op = operation & 7u;
     uint16_t result = value & mask;
+
+    /* D2/D3 with CL==0 performs the microcode path but the ALU leaves both
+     * the operand and every flag unchanged. */
     if (count == 0u) {
         return result;
     }
 
-    const uint16_t original = result;
-    bool cf = (cpu->flags & C_FLAG) != 0u;
-    for (unsigned i = 0; i < count; i++) {
-        switch (operation & 7u) {
-            case 0: { /* ROL */
-                const bool msb = (result & sign) != 0u;
-                result = (uint16_t)(((result << 1) | (msb ? 1u : 0u)) & mask);
-                cf = msb;
-                break;
-            }
-            case 1: { /* ROR */
-                const bool lsb = (result & 1u) != 0u;
-                result = (uint16_t)((result >> 1) | (lsb ? sign : 0u));
-                cf = lsb;
-                break;
-            }
-            case 2: { /* RCL */
-                const bool msb = (result & sign) != 0u;
-                result = (uint16_t)(((result << 1) | (cf ? 1u : 0u)) & mask);
-                cf = msb;
-                break;
-            }
-            case 3: { /* RCR */
-                const bool lsb = (result & 1u) != 0u;
-                result = (uint16_t)((result >> 1) | (cf ? sign : 0u));
-                cf = lsb;
-                break;
-            }
-            case 4:
-            case 6: { /* SHL/SAL */
-                cf = (result & sign) != 0u;
-                result = (uint16_t)((result << 1) & mask);
-                break;
-            }
-            case 5: { /* SHR */
-                cf = (result & 1u) != 0u;
-                result >>= 1;
-                break;
-            }
-            case 7: { /* SAR */
-                cf = (result & 1u) != 0u;
-                result = (uint16_t)((result >> 1) | (result & sign));
-                break;
-            }
-        }
-    }
-    set_flag_state(cpu, C_FLAG, cf);
-
-    if ((operation & 7u) >= 4u) {
+    /* Original NMOS decode: /6 is SETMO for D0/D1 and SETMOC for D2/D3.
+     * SETMOC differs only in that a zero CL is a no-op, handled above. */
+    if (op == 6u) {
+        result = mask;
+        set_flag_state(cpu, C_FLAG, false);
+        set_flag_state(cpu, A_FLAG, false);
+        set_flag_state(cpu, V_FLAG, false);
         if (word) {
             set_szp16(cpu, result);
         } else {
             set_szp8(cpu, (uint8_t)result);
         }
+        return result;
     }
 
-    if (count == 1u) {
-        switch (operation & 7u) {
-            case 0:
-            case 2:
-            case 4:
-            case 6:
-                set_flag_state(cpu, V_FLAG, ((result & sign) != 0u) != cf);
+    const uint16_t original = result;
+    bool cf = (cpu->flags & C_FLAG) != 0u;
+    bool of = (cpu->flags & V_FLAG) != 0u;
+
+    /* Keep the already-perfect D0/D1 rotate path explicit.  This is also the
+     * correct path for D2/D3 when CL==1.  No undefined non-C/O flags move. */
+    if (count == 1u && op < 4u) {
+        switch (op) {
+            case 0u: { /* ROL */
+                const bool outgoing = (result & sign) != 0u;
+                result = (uint16_t)(((result << 1) | (outgoing ? 1u : 0u)) & mask);
+                cf = outgoing;
+                of = cf != ((result & sign) != 0u);
                 break;
-            case 1:
-                set_flag_state(cpu, V_FLAG, ((result & sign) != 0u) != ((result & (sign >> 1)) != 0u));
+            }
+            case 1u: { /* ROR */
+                const bool outgoing = (result & 1u) != 0u;
+                result = (uint16_t)((result >> 1) | (outgoing ? sign : 0u));
+                cf = outgoing;
+                of = ((result & sign) != 0u) != ((result & (sign >> 1)) != 0u);
                 break;
-            case 3:
-                set_flag_state(cpu, V_FLAG, ((result & sign) != 0u) != ((result & (sign >> 1)) != 0u));
+            }
+            case 2u: { /* RCL */
+                const bool incoming = cf;
+                const bool outgoing = (result & sign) != 0u;
+                result = (uint16_t)(((result << 1) | (incoming ? 1u : 0u)) & mask);
+                cf = outgoing;
+                of = cf != ((result & sign) != 0u);
                 break;
-            case 5:
-                set_flag_state(cpu, V_FLAG, (original & sign) != 0u);
+            }
+            case 3u: { /* RCR */
+                const bool incoming = cf;
+                const bool outgoing = (result & 1u) != 0u;
+                result = (uint16_t)((result >> 1) | (incoming ? sign : 0u));
+                cf = outgoing;
+                of = ((result & sign) != 0u) != ((result & (sign >> 1)) != 0u);
                 break;
-            case 7:
-                set_flag_state(cpu, V_FLAG, false);
+            }
+            default:
+                break;
+        }
+        set_flag_state(cpu, C_FLAG, cf);
+        set_flag_state(cpu, V_FLAG, of);
+        return result;
+    }
+
+    /* Direct transcription of MartyPC's current NMOS ALU iteration.  OF is
+     * the value produced by the final physical micro-iteration, even where
+     * Intel documents it as undefined for counts greater than one. */
+    for (unsigned i = 0; i < count; i++) {
+        switch (op) {
+            case 0u: { /* ROL */
+                const bool outgoing = (result & sign) != 0u;
+                result = (uint16_t)(((result << 1) | (outgoing ? 1u : 0u)) & mask);
+                cf = outgoing;
+                of = cf != ((result & sign) != 0u);
+                break;
+            }
+            case 1u: { /* ROR */
+                const bool outgoing = (result & 1u) != 0u;
+                result >>= 1;
+                of = outgoing != ((result & (sign >> 1)) != 0u);
+                result = (uint16_t)(result | (outgoing ? sign : 0u));
+                cf = outgoing;
+                break;
+            }
+            case 2u: { /* RCL */
+                const bool incoming = cf;
+                const bool outgoing = (result & sign) != 0u;
+                result = (uint16_t)((result << 1) & mask);
+                result = (uint16_t)(result | (incoming ? 1u : 0u));
+                cf = outgoing;
+                of = cf != ((result & sign) != 0u);
+                break;
+            }
+            case 3u: { /* RCR */
+                const bool incoming = cf;
+                const bool outgoing = (result & 1u) != 0u;
+                result >>= 1;
+                of = incoming != ((result & (sign >> 1)) != 0u);
+                result = (uint16_t)(result | (incoming ? sign : 0u));
+                cf = outgoing;
+                break;
+            }
+            case 4u: { /* SHL/SAL */
+                const bool outgoing = (result & sign) != 0u;
+                result = (uint16_t)((result << 1) & mask);
+                cf = outgoing;
+                of = cf != ((result & sign) != 0u);
+                break;
+            }
+            case 5u: { /* SHR */
+                cf = (result & 1u) != 0u;
+                result >>= 1;
+                break;
+            }
+            case 7u: { /* SAR */
+                cf = (result & 1u) != 0u;
+                result = (uint16_t)((result >> 1) | (result & sign));
+                break;
+            }
+            default:
                 break;
         }
     }
-    (void)bits;
+
+    set_flag_state(cpu, C_FLAG, cf);
+    switch (op) {
+        case 0u:
+        case 1u:
+        case 2u:
+        case 3u:
+            set_flag_state(cpu, V_FLAG, of);
+            break;
+
+        case 4u:
+            /* NMOS SHL exposes AF as bit 4 of the final shifted result. */
+            set_flag_state(cpu, V_FLAG, of);
+            set_flag_state(cpu, A_FLAG, (result & 0x10u) != 0u);
+            if (word) set_szp16(cpu, result); else set_szp8(cpu, (uint8_t)result);
+            break;
+
+        case 5u:
+            set_flag_state(cpu, V_FLAG, count == 1u && (original & sign) != 0u);
+            set_flag_state(cpu, A_FLAG, false);
+            if (word) set_szp16(cpu, result); else set_szp8(cpu, (uint8_t)result);
+            break;
+
+        case 7u:
+            set_flag_state(cpu, V_FLAG, false);
+            set_flag_state(cpu, A_FLAG, false);
+            if (word) set_szp16(cpu, result); else set_szp8(cpu, (uint8_t)result);
+            break;
+
+        default:
+            break;
+    }
     return result;
 }
 
@@ -1953,17 +2075,25 @@ static void do_daa(m808x_cpu_t *cpu)
 {
     const uint8_t old_al = AL;
     const bool old_cf = (cpu->flags & C_FLAG) != 0u;
-    if ((AL & 0x0fu) > 9u || (cpu->flags & A_FLAG) != 0u) {
+    const bool old_af = (cpu->flags & A_FLAG) != 0u;
+    const uint8_t al_check = old_af ? 0x9fu : 0x99u;
+
+    /* Undefined OF is stable on the NMOS 8088 and is part of the V2 oracle. */
+    set_flag_state(cpu, V_FLAG,
+                   old_cf ? (old_al >= 0x1au && old_al <= 0x7fu)
+                          : (old_al >= 0x7au && old_al <= 0x7fu));
+
+    set_flag_state(cpu, C_FLAG, false);
+    if ((old_al & 0x0fu) > 9u || old_af) {
         AL = (uint8_t)(AL + 6u);
         set_flag_state(cpu, A_FLAG, true);
     } else {
         set_flag_state(cpu, A_FLAG, false);
     }
-    if (old_al > 0x99u || old_cf) {
+
+    if (old_al > al_check || old_cf) {
         AL = (uint8_t)(AL + 0x60u);
         set_flag_state(cpu, C_FLAG, true);
-    } else {
-        set_flag_state(cpu, C_FLAG, false);
     }
     set_szp8(cpu, AL);
 }
@@ -1972,41 +2102,90 @@ static void do_das(m808x_cpu_t *cpu)
 {
     const uint8_t old_al = AL;
     const bool old_cf = (cpu->flags & C_FLAG) != 0u;
-    if ((AL & 0x0fu) > 9u || (cpu->flags & A_FLAG) != 0u) {
+    const bool old_af = (cpu->flags & A_FLAG) != 0u;
+    const uint8_t al_check = old_af ? 0x9fu : 0x99u;
+    bool of = false;
+
+    if (!old_af && !old_cf) {
+        of = old_al >= 0x9au && old_al <= 0xdfu;
+    } else if (old_af && !old_cf) {
+        of = (old_al >= 0x80u && old_al <= 0x85u) ||
+             (old_al >= 0xa0u && old_al <= 0xe5u);
+    } else if (!old_af && old_cf) {
+        of = old_al >= 0x80u && old_al <= 0xdfu;
+    } else {
+        of = old_al >= 0x80u && old_al <= 0xe5u;
+    }
+    set_flag_state(cpu, V_FLAG, of);
+
+    set_flag_state(cpu, C_FLAG, false);
+    if ((old_al & 0x0fu) > 9u || old_af) {
         AL = (uint8_t)(AL - 6u);
         set_flag_state(cpu, A_FLAG, true);
     } else {
         set_flag_state(cpu, A_FLAG, false);
     }
-    if (old_al > 0x99u || old_cf) {
+
+    if (old_al > al_check || old_cf) {
         AL = (uint8_t)(AL - 0x60u);
         set_flag_state(cpu, C_FLAG, true);
-    } else {
-        set_flag_state(cpu, C_FLAG, false);
     }
     set_szp8(cpu, AL);
 }
 
 static void do_aaa(m808x_cpu_t *cpu)
 {
-    if ((AL & 0x0fu) > 9u || (cpu->flags & A_FLAG) != 0u) {
-        AX = (uint16_t)(AX + 0x0106u);
-        cpu->flags |= (A_FLAG | C_FLAG);
+    const uint8_t old_al = AL;
+    uint8_t new_al;
+
+    CYCLES_MC(cpu, 0x148u, 0x149u, 0x14au, 0x14bu, 0x14cu, 0x14du);
+    if ((old_al & 0x0fu) > 9u || (cpu->flags & A_FLAG) != 0u) {
+        AH = (uint8_t)(AH + 1u);
+        new_al = (uint8_t)(old_al + 6u);
+        AL = (uint8_t)(new_al & 0x0fu);
+        set_flag_state(cpu, A_FLAG, true);
+        set_flag_state(cpu, C_FLAG, true);
     } else {
-        cpu->flags &= (uint16_t)~(A_FLAG | C_FLAG);
+        new_al = old_al;
+        AL = (uint8_t)(old_al & 0x0fu);
+        set_flag_state(cpu, A_FLAG, false);
+        set_flag_state(cpu, C_FLAG, false);
+        biu_cycle_i(cpu, MC_JUMP, NULL);
     }
-    AL &= 0x0fu;
+
+    set_flag_state(cpu, Z_FLAG, new_al == 0u);
+    set_flag_state(cpu, P_FLAG, parity_even8(new_al));
+    set_flag_state(cpu, V_FLAG, old_al >= 0x7au && old_al <= 0x7fu);
+    set_flag_state(cpu, S_FLAG, old_al >= 0x7au && old_al <= 0xf9u);
 }
 
 static void do_aas(m808x_cpu_t *cpu)
 {
-    if ((AL & 0x0fu) > 9u || (cpu->flags & A_FLAG) != 0u) {
-        AX = (uint16_t)(AX - 0x0106u);
-        cpu->flags |= (A_FLAG | C_FLAG);
+    const uint8_t old_al = AL;
+    const bool old_af = (cpu->flags & A_FLAG) != 0u;
+    uint8_t new_al;
+
+    CYCLES_MC(cpu, 0x148u, 0x149u, 0x14au, 0x14bu, MC_JUMP, 0x14du);
+    if ((old_al & 0x0fu) > 9u || old_af) {
+        new_al = (uint8_t)(old_al - 6u);
+        AH = (uint8_t)(AH - 1u);
+        AL = (uint8_t)(new_al & 0x0fu);
+        set_flag_state(cpu, A_FLAG, true);
+        set_flag_state(cpu, C_FLAG, true);
     } else {
-        cpu->flags &= (uint16_t)~(A_FLAG | C_FLAG);
+        new_al = old_al;
+        AL = (uint8_t)(old_al & 0x0fu);
+        set_flag_state(cpu, A_FLAG, false);
+        set_flag_state(cpu, C_FLAG, false);
+        biu_cycle_i(cpu, MC_JUMP, NULL);
     }
-    AL &= 0x0fu;
+
+    set_flag_state(cpu, V_FLAG, old_af && old_al >= 0x80u && old_al <= 0x85u);
+    set_flag_state(cpu, S_FLAG,
+                   (!old_af && old_al >= 0x80u) ||
+                   (old_af && (old_al <= 0x05u || old_al >= 0x86u)));
+    set_flag_state(cpu, Z_FLAG, new_al == 0u);
+    set_flag_state(cpu, P_FLAG, parity_even8(new_al));
 }
 
 static uint16_t width_mask(unsigned bits)
@@ -2055,19 +2234,22 @@ static mul_tmp_t mul_cor_negate_cycles(m808x_cpu_t *cpu,
                                        bool negate,
                                        bool skip)
 {
-    const uint16_t mask = width_mask(bits);
     bool carry = false;
-    bool ignored = false;
     uint16_t sigma = 0u;
 
     if (!skip) {
-        sigma = width_neg(tmpc, bits, &carry);
+        /* NEGATE's tmpa/tmpb/tmpc datapath is the physical 16-bit ALU even
+         * when CORX itself is operating on bytes.  Keeping the sign-extended
+         * upper byte is architecturally invisible in AX, but IMULCOF exposes
+         * it through its otherwise-undefined S/Z/P/A flags. */
+        sigma = (uint16_t)(0u - tmpc);
+        carry = tmpc != 0u;
         tmpc = sigma;
         if (carry) {
-            sigma = (uint16_t)(~tmpa & mask);
+            sigma = (uint16_t)~tmpa;
             CYCLES_MC(cpu, 0x1b6u, 0x1b7u, 0x1b8u, MC_JUMP, 0x1bau);
         } else {
-            sigma = width_neg(tmpa, bits, &ignored);
+            sigma = (uint16_t)(0u - tmpa);
             CYCLES_MC(cpu, 0x1b6u, 0x1b7u, 0x1b8u, 0x1b9u, 0x1bau);
         }
         tmpa = sigma;
@@ -2076,7 +2258,7 @@ static mul_tmp_t mul_cor_negate_cycles(m808x_cpu_t *cpu,
 
     const uint16_t sign = bits == 8u ? 0x0080u : 0x8000u;
     carry = (tmpb & sign) != 0u;
-    sigma = width_neg(tmpb, bits, &ignored);
+    sigma = (uint16_t)(0u - tmpb);
     CYCLES_MC(cpu, 0x1bbu, 0x1bcu, 0x1bdu);
     if (!carry) {
         CYCLES_MC(cpu, MC_JUMP, 0x1bfu, MC_JUMP);
@@ -2103,7 +2285,19 @@ static mul_tmp_t mul_corx_cycles(m808x_cpu_t *cpu,
     for (;;) {
         biu_cycle_i(cpu, 0x181u, NULL);
         if (carry) {
-            tmpa = width_add(tmpa, tmpb, bits, &carry);
+            const uint16_t lhs = (uint16_t)(tmpa & width_mask(bits));
+            const uint16_t rhs = (uint16_t)(tmpb & width_mask(bits));
+            tmpa = width_add(lhs, rhs, bits, &carry);
+            const uint16_t sign = bits == 8u ? 0x0080u : 0x8000u;
+            const bool overflow = (((lhs ^ tmpa) & (rhs ^ tmpa) & sign) != 0u);
+            const bool aux = (((lhs ^ rhs ^ tmpa) & 0x10u) != 0u);
+            /* 183 is F-marked.  MUL later overwrites these flags in MULCOF/
+             * IMULCOF, but AAD intentionally exposes C/A/O from the final
+             * CORX addition while replacing only S/Z/P from its AL result. */
+            set_flag_state(cpu, C_FLAG, carry);
+            set_flag_state(cpu, V_FLAG, overflow);
+            set_flag_state(cpu, A_FLAG, aux);
+            if (bits == 8u) set_szp8(cpu, (uint8_t)tmpa); else set_szp16(cpu, tmpa);
             CYCLES_MC(cpu, 0x182u, 0x183u);
         } else {
             biu_cycle_i(cpu, MC_JUMP, NULL);
@@ -2144,12 +2338,13 @@ static void mul_microcode_cycles(m808x_cpu_t *cpu,
     uint16_t tmpb = operand & mask;
     uint16_t tmpc = accumulator & mask;
     bool carry = (tmpc & sign) != 0u;
-    bool ignored = false;
 
     CYCLES_MC(cpu, entry0, entry1);
 
     if (signed_op) {
-        const uint16_t sigma = width_neg(tmpc, bits, &ignored);
+        /* PREIMUL also negates the 16-bit temporary, not an 8-bit-truncated
+         * value.  CORX consumes only the selected width later. */
+        const uint16_t sigma = (uint16_t)(0u - tmpc);
         CYCLES_MC(cpu, MC_JUMP, 0x1c0u, 0x1c1u);
         if (carry) {
             tmpc = sigma;
@@ -2184,8 +2379,17 @@ static void mul_microcode_cycles(m808x_cpu_t *cpu,
     if (signed_op) {
         biu_cycle_i(cpu, MC_JUMP, NULL);
         const bool sign_low = (tmpc & sign) != 0u;
-        const uint16_t sigma = (uint16_t)((tmpa + (sign_low ? 1u : 0u)) & mask);
+        const uint16_t addend = sign_low ? 1u : 0u;
+        /* IMULCOF feeds tmpa through the 16-bit ALU for both byte and word
+         * multiplication.  Do not mask the byte form before its flags are
+         * latched. */
+        const uint16_t sigma = (uint16_t)(tmpa + addend);
+        const bool aux = ((tmpa ^ addend ^ sigma) & 0x10u) != 0u;
         CYCLES_MC(cpu, 0x1cdu, 0x1ceu, 0x1cfu);
+        set_flag_state(cpu, A_FLAG, aux);
+        /* IMULCOF's SIGMA flags are generated by the 16-bit ALU even for
+         * the byte form; the V2 vectors expose those undefined bits. */
+        set_szp16(cpu, sigma);
         if (sigma == 0u) {
             CYCLES_MC(cpu, 0x1d0u, MC_JUMP, 0x1ccu, MC_JUMP);
         } else {
@@ -2645,6 +2849,7 @@ static void execute_mov_rm_reg(m808x_cpu_t *cpu, uint8_t opcode)
     const bool direction = (opcode & 2u) != 0u;
     const uint16_t value = direction ? read_rm(cpu, word) : read_reg_field(cpu, word);
     if (!direction && rm_is_memory(cpu)) {
+        ea_done_return(cpu);
         CYCLES_MC(cpu, 0x000u, 0x001u);
     }
     if (direction) {
@@ -2827,7 +3032,13 @@ static void execute_group45(m808x_cpu_t *cpu, uint8_t opcode)
 {
     const bool word = opcode == 0xffu;
     const unsigned subop = cpu->ins.reg;
-    const uint16_t operand = read_rm(cpu, word);
+    uint16_t operand = 0u;
+
+    /* Far CALL/JMP consume a 32-bit pointer and must not perform the generic
+     * eager r/m read first.  All other group-4/5 operations use one operand. */
+    if (subop != 3u && subop != 5u)
+        operand = read_rm(cpu, word);
+
     switch (subop) {
         case 0u:
         case 1u: {
@@ -2854,9 +3065,9 @@ static void execute_group45(m808x_cpu_t *cpu, uint8_t opcode)
             uint16_t off;
             uint16_t seg;
             if (rm_is_memory(cpu)) {
+                off = read_rm(cpu, true);
                 biu_cycle_i(cpu, 0x068u, NULL);
-                off = read_far_offset(cpu);
-                seg = read_far_segment(cpu);
+                seg = biu_read_u16(cpu, cpu->ins.ea_segment, (uint16_t)(cpu->ins.ea + 2u));
             } else {
                 const m808x_segment_t default_seg = cpu->ins.has_segment_override ? cpu->ins.segment_override : SEG_DS;
                 biu_cycle_i(cpu, 0x069u, NULL);
@@ -2879,11 +3090,11 @@ static void execute_group45(m808x_cpu_t *cpu, uint8_t opcode)
             uint16_t off;
             uint16_t seg;
             if (rm_is_memory(cpu)) {
+                off = read_rm(cpu, true);
                 biu_cycle_i(cpu, 0x0dcu, NULL);
                 biu_fetch_suspend(cpu);
                 biu_cycle_i(cpu, 0x0ddu, NULL);
-                off = read_far_offset(cpu);
-                seg = read_far_segment(cpu);
+                seg = biu_read_u16(cpu, cpu->ins.ea_segment, (uint16_t)(cpu->ins.ea + 2u));
             } else {
                 const m808x_segment_t default_seg = cpu->ins.has_segment_override ? cpu->ins.segment_override : SEG_DS;
                 biu_cycle(cpu);
@@ -2901,7 +3112,11 @@ static void execute_group45(m808x_cpu_t *cpu, uint8_t opcode)
         case 7u: { /* PUSH, /7 alias */
             CYCLES_MC(cpu, 0x024u, 0x025u, 0x026u);
             SP = (uint16_t)(SP - 2u);
-            if (word) biu_write_u16(cpu, SEG_SS, SP, operand); else biu_write_u8(cpu, SEG_SS, SP, (uint8_t)operand);
+            /* On the original 8086/8088, every encoding that reads SP as the
+             * source of PUSH observes it after the predecrement.  The generic
+             * r/m read happened earlier, so repair FF /6 and its /7 alias here. */
+            const uint16_t pushed = word && !rm_is_memory(cpu) && cpu->ins.rm == 4u ? SP : operand;
+            if (word) biu_write_u16(cpu, SEG_SS, SP, pushed); else biu_write_u8(cpu, SEG_SS, SP, (uint8_t)pushed);
             break;
         }
     }
@@ -3028,12 +3243,13 @@ static bool execute_instruction(m808x_cpu_t *cpu)
 
         case 0x8cu: {
             const uint16_t value = segment_value(cpu, cpu->ins.reg);
-            if (rm_is_memory(cpu)) biu_cycle_i(cpu, 0x0ecu, NULL);
+            if (rm_is_memory(cpu)) { ea_done_return(cpu); biu_cycle_i(cpu, 0x0ecu, NULL); }
             write_rm(cpu, true, value);
             return !cpu->fatal;
         }
 
         case 0x8du:
+            if (rm_is_memory(cpu)) ea_done_return(cpu);
             write_reg_field(cpu, true, rm_is_memory(cpu) ? cpu->ins.ea : cpu->ea_addr);
             return true;
 
@@ -3044,6 +3260,7 @@ static bool execute_instruction(m808x_cpu_t *cpu)
         }
 
         case 0x8fu: {
+            if (rm_is_memory(cpu)) ea_done_return(cpu);
             biu_cycle_i(cpu, 0x040u, NULL);
             const uint16_t value = pop_u16(cpu);
             biu_cycle_i(cpu, 0x042u, NULL);
@@ -3120,6 +3337,7 @@ static bool execute_instruction(m808x_cpu_t *cpu)
         case 0xa3u: {
             const bool word = (opcode & 1u) != 0u;
             const uint16_t off = read_queue_u16(cpu);
+            biu_cycle_i(cpu, 0x064u, NULL);
             const m808x_segment_t seg = cpu->ins.has_segment_override ? cpu->ins.segment_override : SEG_DS;
             if (word) biu_write_u16(cpu, seg, off, AX); else biu_write_u8(cpu, seg, off, AL);
             return !cpu->fatal;
@@ -3163,16 +3381,23 @@ static bool execute_instruction(m808x_cpu_t *cpu)
 
         case 0xc4u:
         case 0xc5u: {
-            CYCLES_MC(cpu, opcode == 0xc4u ? 0x0f0u : 0x0f4u,
-                           opcode == 0xc4u ? 0x0f1u : 0x0f5u);
             uint16_t off;
             uint16_t seg;
             if (rm_is_memory(cpu)) {
-                off = read_far_offset(cpu);
-                seg = read_far_segment(cpu);
+                /* EALOAD has already obtained the offset word before the LES/LDS
+                 * micro-routine; only the segment word at EA+2 is read here. */
+                off = read_rm(cpu, true);
+                CYCLES_MC(cpu, opcode == 0xc4u ? 0x0f0u : 0x0f4u,
+                               opcode == 0xc4u ? 0x0f1u : 0x0f5u);
+                seg = biu_read_u16(cpu, cpu->ins.ea_segment, (uint16_t)(cpu->ins.ea + 2u));
             } else {
-                off = get_reg16(cpu, cpu->ins.rm);
-                seg = biu_read_u16(cpu, SEG_DS, 4u);
+                /* Invalid register form follows the uninitialised IND path.
+                 * A fresh core has last-EA zero; retain ea_addr as that latch. */
+                CYCLES_MC(cpu, opcode == 0xc4u ? 0x0f0u : 0x0f4u,
+                               opcode == 0xc4u ? 0x0f1u : 0x0f5u);
+                const m808x_segment_t dseg = cpu->ins.has_segment_override ? cpu->ins.segment_override : SEG_DS;
+                off = biu_read_u16(cpu, dseg, cpu->ea_addr);
+                seg = biu_read_u16(cpu, dseg, (uint16_t)(cpu->ea_addr + 2u));
             }
             write_reg_field(cpu, true, off);
             cpu->segs[opcode == 0xc4u ? SEG_ES : SEG_DS] = seg;
@@ -3182,6 +3407,9 @@ static bool execute_instruction(m808x_cpu_t *cpu)
         case 0xc6u:
         case 0xc7u: {
             const bool word = (opcode & 1u) != 0u;
+            /* Write-only ModR/M operands take EADONE before the immediate
+             * bytes are consumed by the instruction micro-routine. */
+            if (rm_is_memory(cpu)) ea_done_return(cpu);
             const uint16_t imm = word ? read_queue_u16(cpu) : queue_read(cpu, false);
             if (!word) biu_cycle_i(cpu, MC_JUMP, NULL);
             if (rm_is_memory(cpu)) biu_cycle_i(cpu, 0x016u, NULL);
@@ -3233,12 +3461,6 @@ static bool execute_instruction(m808x_cpu_t *cpu)
         case 0xd4u: {
             const uint8_t base = queue_read(cpu, false);
             CYCLES_MC(cpu, 0x175u, 0x176u, MC_JUMP);
-            if (base == 0u) {
-                set_szp8(cpu, 0u);
-                cpu->flags &= (uint16_t)~(A_FLAG | C_FLAG | V_FLAG);
-                divide_interrupt(cpu);
-                return !cpu->fatal;
-            }
             const m808x_cord_result_t aam_cord = cord_cycles(cpu, 8u, 0u, base, AL);
             if (!aam_cord.ok) {
                 divide_interrupt(cpu);
@@ -3255,8 +3477,11 @@ static bool execute_instruction(m808x_cpu_t *cpu)
         case 0xd5u: {
             const uint8_t base = queue_read(cpu, false);
             CYCLES_MC(cpu, 0x170u, 0x171u, MC_JUMP);
-            (void)mul_corx_cycles(cpu, 8u, AH, base, false);
-            AL = (uint8_t)((uint16_t)AH * base + AL);
+            const mul_tmp_t aad_product = mul_corx_cycles(cpu, 8u, AH, base, false);
+            /* AAD's final ADD is F-marked.  It replaces CORX's C/A/O with
+             * those from AL + product, then the following microflow leaves
+             * S/Z/P from the final AL value. */
+            AL = (uint8_t)alu_binary(cpu, ALU_ADD, AL, aad_product.c, false);
             AH = 0u;
             CYCLES_MC(cpu, 0x172u, 0x173u);
             set_szp8(cpu, AL);
@@ -3282,6 +3507,7 @@ static bool execute_instruction(m808x_cpu_t *cpu)
 
         case 0xd8u: case 0xd9u: case 0xdau: case 0xdbu:
         case 0xdcu: case 0xddu: case 0xdeu: case 0xdfu:
+            if (rm_is_memory(cpu)) (void)read_rm(cpu, true);
             m808x_86box_export_arch_state(cpu);
             m808x_86box_fpu_exec(opcode, cpu->ins.modrm, cpu->ins.ea,
                                  (uint8_t)cpu->ins.ea_segment);
@@ -3527,6 +3753,11 @@ static void m808x_host_cycle(void)
         return;
 
     cpu_state._cycles--;
+    if (m808x_host_tsc_credit > 0u) {
+        --m808x_host_tsc_credit;
+        return;
+    }
+
     tsc += ((uint64_t)xt_cpu_multi >> 32ULL);
     if (TIMER_VAL_LESS_THAN_VAL(timer_target, (uint64_t)tsc))
         timer_process();
@@ -3632,6 +3863,7 @@ void m808x_86box_reset(int hard)
     m808x_cpu.configured_wait_states = is_mazovia ? 1u : 0u;
 
     m808x_in_host_bus_callback = false;
+    m808x_host_tsc_credit = 0u;
 #ifdef M808X_86BOX_TESTING
     m808x_test_captured_wait_clocks = 0;
     m808x_test_tw_clocks = 0;
@@ -3718,6 +3950,10 @@ void m808x_86box_exec(int32_t cycs)
 
         if (m808x_cpu.halted) {
             if (m808x_cpu.nmi_pin) {
+                /* Unlike the normal instruction-boundary path, HLT wake-up
+                 * bypasses finish_instruction(), so set the architectural NMI
+                 * vector here instead of reusing a stale INTR/software vector. */
+                m808x_cpu.interrupt_vector = 2u;
                 hardware_interrupt(&m808x_cpu, false);
                 m808x_consume_host_nmi();
                 biu_fetch_next(&m808x_cpu);

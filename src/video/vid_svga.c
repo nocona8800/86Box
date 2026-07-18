@@ -42,7 +42,6 @@
 #include <86box/vid_xga.h>
 #include <86box/vid_svga.h>
 #include <86box/vid_svga_render.h>
-#include "crt86/crt86box.h" /* CRT86BOX_ASYNC_CPU */
 #include <86box/vid_xga_device.h>
 
 void svga_doblit(int wx, int wy, svga_t *svga);
@@ -1284,10 +1283,6 @@ svga_recalctimings(svga_t *svga)
                 break;
         }
     }
-
-    /* Publish the card's physical timing after extended CRTC and clock logic. */
-    crt86_publish_svga(svga);
-
 }
 
 static void

@@ -828,11 +828,15 @@ pit_irq0_timer_ps2(int new_out, int old_out, UNUSED(void *priv))
         pit_devs[1].ctr_clock(pit_devs[1].data, 0);
 }
 
+
 void
 pit_refresh_timer_xt(int new_out, int old_out, UNUSED(void *priv))
 {
-    if (new_out && !old_out)
-        dma_channel_read(0);
+    if (new_out && !old_out) {
+        dma_set_drq(0, 1);
+        (void) dma_channel_read(0);
+        dma_set_drq(0, 0);
+    }
 }
 
 void

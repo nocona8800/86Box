@@ -42,7 +42,7 @@
 #include <86box/thread.h>
 #include <86box/video.h>
 #include <86box/vid_svga.h>
-#include "crt86/crt86box.h" /* CRT86BOX_ASYNC_CPU */
+#include "syncpll/syncpll86box.h" /* SYNCPLL86BOX_CGA_ONLY */
 
 #include <minitrace/minitrace.h>
 
@@ -418,15 +418,13 @@ blit_thread(void *param)
         thread_reset_event(data->wake_blit_thread);
         MTR_BEGIN("video", "blit_thread");
 
-        /* CRT86_ASYNC: submission is only a raw-frame copy into a
-           latest-frame mailbox. The complete electron-gun/deflection/phosphor
-           model runs on its own worker and may drop intermediate video frames
-           rather than ever blocking 86Box emulation. */
-        crt86_process_blit(data->x, data->y, data->w, data->h, data->monitor_index);
-        crt86_present_begin(data->monitor_index);
+        /* SYNCPLL_CGA_ONLY: for continuous CGA, replace the source
+           rectangle with the most recent H/V-PLL-scanned raster. Other video
+           adapters are untouched and pass through normally. */
+        syncpll_process_blit(data->x, data->y, data->w, data->h,
+                             data->monitor_index);
         if (blit_func)
             blit_func(data->x, data->y, data->w, data->h, data->monitor_index);
-        crt86_present_end(data->monitor_index);
 
         data->busy = 0;
 
@@ -860,7 +858,7 @@ video_init(void)
 {
     uint8_t total[2] = { 0, 1 };
 
-    crt86_global_init();
+    syncpll_global_init();
 
     for (uint8_t c = 0; c < 16; c++) {
         cga_2_table[c] = (total[(c >> 3) & 1] << 0) | (total[(c >> 2) & 1] << 8) | (total[(c >> 1) & 1] << 16) | (total[(c >> 0) & 1] << 24);
@@ -933,7 +931,7 @@ void
 video_close(void)
 {
     video_monitor_close(0);
-    crt86_global_shutdown();
+    syncpll_global_shutdown();
 
     free(video_16to32);
     free(video_15to32);

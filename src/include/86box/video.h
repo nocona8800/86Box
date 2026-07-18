@@ -18,7 +18,7 @@
  */
 #ifndef EMU_VIDEO_H
 #define EMU_VIDEO_H
-
+#include <stddef.h>
 #ifdef __cplusplus
 #    include <atomic>
 using atomic_bool = std::atomic_bool;
