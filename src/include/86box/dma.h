@@ -121,4 +121,6 @@ void dma_set_sg_base(uint8_t sg_base);
 
 extern int dma_channel_readable(int channel);
 
+extern void dma_xt_refresh_request(void);
+
 #endif /*EMU_DMA_H*/

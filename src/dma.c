@@ -19,6 +19,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <wchar.h>
 #define HAVE_STDARG_H
@@ -31,6 +32,7 @@
 #include <86box/io.h>
 #include <86box/pic.h>
 #include <86box/dma.h>
+#include "808x_marty_86box.h"
 #include <86box/plat_unused.h>
 
 dma_t   dma[8];
@@ -83,6 +85,12 @@ typedef struct dma_xt8237_state_t {
 } dma_xt8237_state_t;
 
 static dma_xt8237_state_t dma_xt8237;
+
+/* 86BOX_MACHINE_EXACT_V1: PIT1 request latch, cleared by DACK0. */
+static bool dma_xt_refresh_queued = false;
+static bool dma_xt_refresh_scheduled = false;
+static bool dma_xt_refresh_dack_active = false;
+static void dma_xt_refresh_try_schedule(void);
 
 static int dma_xt8237_mem_to_mem(void);
 
@@ -193,11 +201,17 @@ static void
 dma_xt8237_charge_bus(int channel)
 {
     if (channel == 0) {
-        is_nec ? refreshread_vx0() : refreshread();
+        /* The exact Marty adapter owns HOLD/HLDA and DMAWAIT. Calling
+         * refreshread() here would add a second fixed four-clock charge. */
+        if (!m808x_86box_active())
+            is_nec ? refreshread_vx0() : refreshread();
     } else {
+        /* Peripheral APIs remain synchronous. Preserve their established
+         * occupancy until their data phases can be deferred to DACK. */
         sub_cycles((dma_command[0] & 0x08) ? 4 : 5);
     }
 }
+
 
 static void
 dma_xt8237_advance_address(int channel)
@@ -265,6 +279,9 @@ dma_xt8237_master_clear(void)
 
     memset(&dma_xt8237, 0, sizeof(dma_xt8237));
     dma_xt8237.last_service = 3;
+    dma_xt_refresh_queued = false;
+    dma_xt_refresh_scheduled = false;
+    dma_xt_refresh_dack_active = false;
 }
 
 #define DMA_PS2_IOA            (1 << 0)
@@ -656,7 +673,7 @@ dma_ext_mode_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
 
     dma[channel].ext_mode = val & 0x7c;
 
-    switch ((val > 2) & 0x03) {
+    switch ((val >> 2) & 0x03) {
         case 0x00:
             dma[channel].transfer_mode = 0x0101;
             break;
@@ -684,7 +701,7 @@ dma_sg_int_status_read(UNUSED(uint16_t addr), UNUSED(void *priv))
 
     for (uint8_t i = 0; i < 8; i++) {
         if (i != 4)
-            ret = (!!(dma[i].sg_status & 8)) << i;
+            ret |= (!!(dma[i].sg_status & 8)) << i;
     }
 
     return ret;
@@ -796,6 +813,9 @@ dma_write(uint16_t addr, uint8_t val, void *priv)
             dma_write_legacy(addr, val, priv);
             return;
     }
+
+    if (dma_xt_refresh_queued)
+        dma_xt_refresh_try_schedule();
 }
 
 static uint8_t
@@ -1416,8 +1436,8 @@ dma_high_page_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
     if (addr < 8) {
         dma[addr].page_h = val;
 
-        dma[addr].ab = ((dma[addr].ab & 0xffffff) | (dma[addr].page << 24)) & dma_mask;
-        dma[addr].ac = ((dma[addr].ac & 0xffffff) | (dma[addr].page << 24)) & dma_mask;
+        dma[addr].ab = ((dma[addr].ab & 0xffffff) | (dma[addr].page_h << 24)) & dma_mask;
+        dma[addr].ac = ((dma[addr].ac & 0xffffff) | (dma[addr].page_h << 24)) & dma_mask;
     }
 }
 
@@ -1576,6 +1596,9 @@ dma_reset(void)
     dma_command[0] = dma_command[1] = 0;
     memset(&dma_xt8237, 0, sizeof(dma_xt8237));
     dma_xt8237.last_service = 3;
+    dma_xt_refresh_queued = false;
+    dma_xt_refresh_scheduled = false;
+    dma_xt_refresh_dack_active = false;
 
     if (!dma_at)
         dma_m = (dma_m & 0xf0) | 0x0f;
@@ -1893,6 +1916,47 @@ dma_channel_readable(int channel)
 
     type = dma[channel].mode & 0x0c;
     return (type == 0x08) || (type == 0x00);
+}
+
+
+/* 86BOX_MACHINE_EXACT_V1: execute the channel-0 transfer at physical DACK. */
+static void
+dma_xt_refresh_dack(void *opaque)
+{
+    (void)opaque;
+    dma_xt_refresh_dack_active = true;
+    (void)dma_channel_read(0);
+    dma_xt_refresh_dack_active = false;
+    dma_set_drq(0, 0);
+    dma_xt_refresh_queued = false;
+    dma_xt_refresh_scheduled = false;
+}
+
+static void
+dma_xt_refresh_try_schedule(void)
+{
+    if (!dma_xt_refresh_queued || dma_xt_refresh_scheduled)
+        return;
+    if (!dma_xt8237_active() || !dma_xt8237_can_service(0))
+        return;
+
+    dma_xt_refresh_scheduled = true;
+    if (m808x_86box_active())
+        m808x_86box_dma_request_ex(6u, dma_xt_refresh_dack, NULL);
+    else
+        dma_xt_refresh_dack(NULL);
+}
+
+void
+dma_xt_refresh_request(void)
+{
+    /* PIT1 clocks a request latch. DREQ0 remains asserted until DACK0, and
+     * another edge cannot stack a second refresh transfer. */
+    if (!dma_xt_refresh_queued) {
+        dma_xt_refresh_queued = true;
+        dma_set_drq(0, 1);
+    }
+    dma_xt_refresh_try_schedule();
 }
 
 int

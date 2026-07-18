@@ -10,6 +10,10 @@ bool m808x_86box_active(void);
 void m808x_86box_reset(int hard);
 void m808x_86box_exec(int32_t cycs);
 void m808x_86box_refresh(void);
+void m808x_86box_dma_request(unsigned wait_clocks);
+void m808x_86box_dma_request_ex(unsigned wait_clocks,
+                                  void (*ack_callback)(void *opaque),
+                                  void *opaque);
 void m808x_86box_wait(int clocks, int bus);
 void m808x_86box_external_sub_cycles(int clocks);
 void m808x_86box_interrupt(uint16_t vector);
@@ -27,6 +31,13 @@ int m808x_86box_pfq_get_size(void);
 bool m808x_86box_test_halted(void);
 uint64_t m808x_86box_test_captured_wait_clocks(void);
 uint64_t m808x_86box_test_tw_clocks(void);
+unsigned m808x_86box_test_dma_state(void);
+unsigned m808x_86box_test_dma_wait_states(void);
+bool m808x_86box_test_dma_holda(void);
+bool m808x_86box_test_dma_ack(void);
+bool m808x_86box_test_dma_aen(void);
+unsigned m808x_86box_test_t_cycle(void);
+unsigned m808x_86box_test_bus_status(void);
 #endif
 
 /* Implemented in 86Box's legacy 808x translation unit so the existing 8087

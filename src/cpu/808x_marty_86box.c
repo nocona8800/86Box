@@ -38,8 +38,9 @@
  * Scope boundary: this models CPU execution/bus flow, not board-level analog
  * behavior. 86Box's existing 8087 operation tables remain authoritative for
  * ESC instructions and are called through the companion bridge in 808x.c.
- * External HOLD/DMA ownership remains represented as clock-steal requests from
- * 86Box rather than a complete 8237 pin-level model inside this file.
+ * XT refresh requests enter a clocked DREQ/HRQ/HOLDA/AEN/DACK scheduler.
+ * Other 86Box DMA peripherals retain the existing synchronous device API and
+ * are intentionally not misrepresented as pin-complete 8237 transfers.
  */
 
 #include <assert.h>
@@ -321,10 +322,9 @@ static void m808x_host_cycle(void);
  * models while converting any cycle deduction into actual Tw states. */
 #define M808X_HOST_CALLBACK_PHASE_BIAS 2
 static bool m808x_in_host_bus_callback = false;
-/* Host-visible time is advanced to the legacy post-access phase before a
- * device callback, then the following physical core clocks consume this
- * credit instead of advancing TSC twice. */
-static unsigned m808x_host_tsc_credit = 0u;
+/* Only the legacy cycle-budget view is biased for compatibility with
+ * contention handlers.  TSC and timers remain at the physical T3/final-Tw
+ * transfer edge; advancing them here would deliver PIT/DMA edges early. */
 #ifdef M808X_86BOX_TESTING
 static uint64_t m808x_test_captured_wait_clocks = 0;
 static uint64_t m808x_test_tw_clocks = 0;
@@ -595,17 +595,7 @@ static void biu_do_bus_transfer(m808x_cpu_t *cpu)
      * budget: the same number of clocks are then emitted below as physical
      * Tw states.  This also catches handlers that call sub_cycles(). */
     const int host_cycles_before = cpu_state._cycles;
-    const uint64_t host_tick = ((uint64_t)xt_cpu_multi >> 32ULL);
     cpu_state._cycles -= M808X_HOST_CALLBACK_PHASE_BIAS;
-
-    /* Legacy 808x.c charged the complete four-clock access before invoking
-     * the device.  Preserve that observable TSC phase without double-counting:
-     * advance now, process due timers, then consume the same number of future
-     * physical core clocks from m808x_host_tsc_credit. */
-    tsc += (uint64_t)M808X_HOST_CALLBACK_PHASE_BIAS * host_tick;
-    m808x_host_tsc_credit += M808X_HOST_CALLBACK_PHASE_BIAS;
-    if (TIMER_VAL_LESS_THAN_VAL(timer_target, (uint64_t)tsc))
-        timer_process();
 
     m808x_in_host_bus_callback = true;
 
@@ -743,6 +733,105 @@ static void biu_bus_end(m808x_cpu_t *cpu)
     cpu->biu.ale = false;
 }
 
+/* IBM PC/XT DRAM refresh bus arbitration.  This is the measured 8088/8237
+ * handshake used by MartyPC: DREQ -> HRQ -> HOLDA -> five controller
+ * operating clocks, with READY stretched for six effective clocks.  The EU
+ * may continue while the BIU is not requesting the bus; an active bus cycle
+ * is stretched through Tw exactly as on hardware. */
+typedef enum m808x_dma_state_t {
+    M808X_DMA_IDLE = 0,
+    M808X_DMA_DREQ,
+    M808X_DMA_HRQ,
+    M808X_DMA_HOLDA,
+    M808X_DMA_OPERATING
+} m808x_dma_state_t;
+
+static m808x_dma_state_t m808x_dma_state = M808X_DMA_IDLE;
+static bool m808x_dma_req = false;
+static bool m808x_dma_holda = false;
+static bool m808x_dma_ack = false;
+static bool m808x_dma_aen = false;
+static unsigned m808x_dma_operating_cycle = 0u;
+static unsigned m808x_dma_wait_states = 0u;
+static unsigned m808x_dma_wait_target = 6u;
+typedef void (*m808x_dma_ack_callback_t)(void *opaque);
+static m808x_dma_ack_callback_t m808x_dma_ack_callback = NULL;
+static void *m808x_dma_ack_opaque = NULL;
+
+static void m808x_dma_tick(m808x_cpu_t *cpu)
+{
+    m808x_biu_t *b = &cpu->biu;
+
+    switch (m808x_dma_state) {
+        case M808X_DMA_IDLE:
+            if (m808x_dma_req)
+                m808x_dma_state = M808X_DMA_DREQ;
+            break;
+
+        case M808X_DMA_DREQ:
+            /* The 8237 raises HRQ one controller clock after observing DREQ. */
+            m808x_dma_state = M808X_DMA_HRQ;
+            break;
+
+        case M808X_DMA_HRQ:
+            /* The PC motherboard generates HOLDA when the bus status is
+             * passive (S0=S1=1), or late enough in the current transfer that
+             * it can complete normally. LOCK suppresses the grant. */
+            if (!cpu->in_lock &&
+                (b->bus_status == BUS_PASSIVE ||
+                 b->t_cycle == T_3 || b->t_cycle == T_W || b->t_cycle == T_4)) {
+                m808x_dma_holda = true;
+                m808x_dma_state = M808X_DMA_HOLDA;
+            }
+            break;
+
+        case M808X_DMA_HOLDA:
+            /* One clock of hold acknowledge precedes 8237 S1/AEN. */
+            if (b->wait_remaining < 2u) {
+                m808x_dma_aen = true;
+                m808x_dma_operating_cycle = 0u;
+                m808x_dma_state = M808X_DMA_OPERATING;
+            }
+            break;
+
+        case M808X_DMA_OPERATING:
+            ++m808x_dma_operating_cycle;
+            switch (m808x_dma_operating_cycle) {
+                case 1u:
+                    /* DMAWAIT after S1.  Seven is decremented at the end of
+                     * this clock, leaving six effective READY-low clocks. */
+                    m808x_dma_wait_states = m808x_dma_wait_target + 1u;
+                    break;
+                case 2u:
+                    /* DACK is asserted after S2.  Execute the controller's
+                     * transfer callback at the same pin phase, not at the PIT
+                     * edge that originally raised DREQ. */
+                    m808x_dma_req = false;
+                    m808x_dma_ack = true;
+                    if (m808x_dma_ack_callback != NULL) {
+                        m808x_dma_ack_callback_t callback = m808x_dma_ack_callback;
+                        void *opaque = m808x_dma_ack_opaque;
+                        m808x_dma_ack_callback = NULL;
+                        m808x_dma_ack_opaque = NULL;
+                        callback(opaque);
+                    }
+                    break;
+                case 4u:
+                    m808x_dma_holda = false;
+                    break;
+                case 5u:
+                    m808x_dma_aen = false;
+                    m808x_dma_ack = false;
+                    m808x_dma_operating_cycle = 0u;
+                    m808x_dma_state = M808X_DMA_IDLE;
+                    break;
+                default:
+                    break;
+            }
+            break;
+    }
+}
+
 static void biu_cycle_i(m808x_cpu_t *cpu, uint16_t mc_line, const char *comment)
 {
     m808x_biu_t *b = &cpu->biu;
@@ -789,12 +878,12 @@ static void biu_cycle_i(m808x_cpu_t *cpu, uint16_t mc_line, const char *comment)
                     break;
                 case T_3:
                     b->bus_status = BUS_PASSIVE;
-                    if (b->wait_remaining == 0u && !b->transfer_done) {
+                    if (b->wait_remaining == 0u && m808x_dma_wait_states == 0u && !b->transfer_done) {
                         biu_do_bus_transfer(cpu);
                     }
                     break;
                 case T_W:
-                    if (b->wait_remaining <= 1u && !b->transfer_done) {
+                    if (b->wait_remaining <= 1u && m808x_dma_wait_states <= 1u && !b->transfer_done) {
                         biu_do_bus_transfer(cpu);
                     }
                     break;
@@ -823,6 +912,9 @@ static void biu_cycle_i(m808x_cpu_t *cpu, uint16_t mc_line, const char *comment)
         m808x_test_cycle_hook(cpu);
 #endif
     trace_cycle(cpu);
+
+    /* Clock the XT 8237 arbitration logic on every physical CPU clock. */
+    m808x_dma_tick(cpu);
 
     if (b->fetch.kind == FETCH_DELAYED && b->t_cycle != T_W && b->fetch.delay > 0u) {
         b->fetch.delay--;
@@ -886,7 +978,7 @@ static void biu_cycle_i(m808x_cpu_t *cpu, uint16_t mc_line, const char *comment)
             b->t_cycle = T_3;
             break;
         case T_3:
-            if (b->wait_remaining > 0u) {
+            if (b->wait_remaining > 0u || m808x_dma_wait_states > 0u) {
                 b->t_cycle = T_W;
             } else {
                 biu_bus_end(cpu);
@@ -894,12 +986,13 @@ static void biu_cycle_i(m808x_cpu_t *cpu, uint16_t mc_line, const char *comment)
             }
             break;
         case T_W:
-            if (b->wait_remaining <= 1u) {
+            if (b->wait_remaining <= 1u && m808x_dma_wait_states <= 1u) {
                 b->wait_remaining = 0u;
                 biu_bus_end(cpu);
                 b->t_cycle = T_4;
             } else {
-                b->wait_remaining--;
+                if (b->wait_remaining > 0u)
+                    --b->wait_remaining;
                 b->t_cycle = T_W;
             }
             break;
@@ -912,6 +1005,8 @@ static void biu_cycle_i(m808x_cpu_t *cpu, uint16_t mc_line, const char *comment)
 
     b->queue.last_op = b->queue.op;
     b->queue.op = QOP_IDLE;
+    if (m808x_dma_wait_states > 0u)
+        --m808x_dma_wait_states;
     cpu->cycle_num++;
     m808x_host_cycle();
 }
@@ -3722,7 +3817,6 @@ static void reset_cpu(m808x_cpu_t *cpu)
 static m808x_cpu_t m808x_cpu;
 static bool m808x_initialized = false;
 static bool m808x_suppress_host_cycles = false;
-static unsigned m808x_refresh_pending = 0u;
 static int m808x_restore_pfq_pos = -1;
 static uint16_t m808x_restore_pfq_ip = 0u;
 static bool m808x_restore_pfq_ip_valid = false;
@@ -3753,11 +3847,6 @@ static void m808x_host_cycle(void)
         return;
 
     cpu_state._cycles--;
-    if (m808x_host_tsc_credit > 0u) {
-        --m808x_host_tsc_credit;
-        return;
-    }
-
     tsc += ((uint64_t)xt_cpu_multi >> 32ULL);
     if (TIMER_VAL_LESS_THAN_VAL(timer_target, (uint64_t)tsc))
         timer_process();
@@ -3839,18 +3928,6 @@ static void m808x_consume_host_nmi(void)
 #endif
 }
 
-static void m808x_service_refresh(void)
-{
-    while (m808x_refresh_pending != 0u) {
-        biu_bus_wait_finish(&m808x_cpu);
-        /* XT refresh steals one four-clock memory cycle.  Address/data are
-         * supplied by the DMA subsystem; the CPU observes only bus loss. */
-        for (unsigned i = 0; i < 4u; ++i)
-            biu_cycle_i(&m808x_cpu, MC_NONE, "DRAM refresh");
-        --m808x_refresh_pending;
-    }
-}
-
 void m808x_86box_reset(int hard)
 {
     (void)hard;
@@ -3863,7 +3940,6 @@ void m808x_86box_reset(int hard)
     m808x_cpu.configured_wait_states = is_mazovia ? 1u : 0u;
 
     m808x_in_host_bus_callback = false;
-    m808x_host_tsc_credit = 0u;
 #ifdef M808X_86BOX_TESTING
     m808x_test_captured_wait_clocks = 0;
     m808x_test_tw_clocks = 0;
@@ -3873,7 +3949,16 @@ void m808x_86box_reset(int hard)
     m808x_suppress_host_cycles = false;
     m808x_cpu.cycle_num = 0u;
     m808x_cpu.instruction_count = 0u;
-    m808x_refresh_pending = 0u;
+    m808x_dma_state = M808X_DMA_IDLE;
+    m808x_dma_req = false;
+    m808x_dma_holda = false;
+    m808x_dma_ack = false;
+    m808x_dma_aen = false;
+    m808x_dma_operating_cycle = 0u;
+    m808x_dma_wait_states = 0u;
+    m808x_dma_wait_target = 6u;
+    m808x_dma_ack_callback = NULL;
+    m808x_dma_ack_opaque = NULL;
     m808x_restore_pfq_pos = -1;
     m808x_restore_pfq_ip = 0u;
     m808x_restore_pfq_ip_valid = false;
@@ -3915,10 +4000,36 @@ void m808x_86box_external_sub_cycles(int clocks)
         timer_process();
 }
 
+void m808x_86box_dma_request_ex(unsigned wait_clocks,
+                                  void (*ack_callback)(void *opaque),
+                                  void *opaque)
+{
+    if (!m808x_86box_active() || wait_clocks == 0u)
+        return;
+
+    /* DACK suppresses retriggering while a transfer owns the bus.  A request
+     * that arrives during arbitration is retained and may increase the bus
+     * occupancy target, but it never shortens an in-flight transfer. */
+    if (!m808x_dma_holda && !m808x_dma_ack) {
+        if (wait_clocks > m808x_dma_wait_target || m808x_dma_state == M808X_DMA_IDLE)
+            m808x_dma_wait_target = wait_clocks;
+        if (ack_callback != NULL) {
+            m808x_dma_ack_callback = ack_callback;
+            m808x_dma_ack_opaque = opaque;
+        }
+        m808x_dma_req = true;
+    }
+}
+
+void m808x_86box_dma_request(unsigned wait_clocks)
+{
+    m808x_86box_dma_request_ex(wait_clocks, NULL, NULL);
+}
+
 void m808x_86box_refresh(void)
 {
-    if (m808x_86box_active())
-        ++m808x_refresh_pending;
+    /* Measured PC/XT refresh DMAWAIT is six effective clocks. */
+    m808x_86box_dma_request(6u);
 }
 
 void m808x_86box_iret_complete(void)
@@ -3935,7 +4046,6 @@ void m808x_86box_exec(int32_t cycs)
     m808x_import_arch_state();
 
     while (cpu_state._cycles > 0 && !m808x_cpu.fatal) {
-        m808x_service_refresh();
         m808x_update_input_pins();
 
         if (m808x_cpu.waiting) {
@@ -4081,5 +4191,40 @@ uint64_t m808x_86box_test_captured_wait_clocks(void)
 uint64_t m808x_86box_test_tw_clocks(void)
 {
     return m808x_test_tw_clocks;
+}
+
+unsigned m808x_86box_test_dma_state(void)
+{
+    return (unsigned)m808x_dma_state;
+}
+
+unsigned m808x_86box_test_dma_wait_states(void)
+{
+    return m808x_dma_wait_states;
+}
+
+bool m808x_86box_test_dma_holda(void)
+{
+    return m808x_dma_holda;
+}
+
+bool m808x_86box_test_dma_ack(void)
+{
+    return m808x_dma_ack;
+}
+
+bool m808x_86box_test_dma_aen(void)
+{
+    return m808x_dma_aen;
+}
+
+unsigned m808x_86box_test_t_cycle(void)
+{
+    return (unsigned)m808x_cpu.biu.t_cycle;
+}
+
+unsigned m808x_86box_test_bus_status(void)
+{
+    return (unsigned)m808x_cpu.biu.bus_status;
 }
 #endif
