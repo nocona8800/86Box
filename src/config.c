@@ -2745,7 +2745,10 @@ config_load(void)
         hide_status_bar      = 0;
         hide_tool_bar        = 0;
         scale                = 1;
+        /* The catalogue is runtime-defined; ibmpc may not be installed. */
         machine              = machine_get_machine_from_internal_name("ibmpc");
+        if (machine < 0)
+            machine = 0;
         dpi_scale            = 1;
         do_auto_pause        = 0;
         do_auto_dialog_pause = 0;
