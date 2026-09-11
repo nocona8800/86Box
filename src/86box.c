@@ -61,6 +61,7 @@
 #include <86box/random.h>
 #include <86box/nvr.h>
 #include <86box/machine.h>
+#include <86box/machine_dsl.h>
 #include <86box/bugger.h>
 #include <86box/postcard.h>
 #include <86box/unittester.h>
@@ -1231,6 +1232,18 @@ usage:
         path_slash(rom_path);
     if (asset_path[0] != '\0')
         path_slash(asset_path);
+
+    /* Compile and register external machine descriptions before configuration
+       parsing or either UI asks for the machine catalogue.  VM-local files
+       intentionally win over descriptions shipped beside the executable. */
+    path_append_filename(temp, usr_path, "machines");
+    machine_dsl_register_directory(temp);
+    path_append_filename(temp, exe_path, "machines");
+    machine_dsl_register_directory(temp);
+    if (machine_count() == 0) {
+        always_log("No machines were registered. Install at least one complete root .86m file in the machines directory.\n");
+        return 0;
+    }
 
     /* At this point, we can safely create the full path name. */
     path_append_filename(cfg_path, usr_path, p);

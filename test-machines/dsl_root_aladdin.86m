@@ -1,0 +1,48 @@
+# A root machine: no machine-table row and no inherited catalogue entry.
+schema 1
+
+machine dsl_root_aladdin {
+    name = "[DSL root] ALi Aladdin V laboratory board"
+
+    catalogue {
+        type = super_socket7
+        chipset = ali.aladdin_v
+        cpu.package = socket5_7
+        cpu.min_bus = 60000000
+        cpu.max_bus = 120000000
+        cpu.min_voltage = 2000
+        cpu.max_voltage = 3520
+        cpu.min_multiplier = 1.5
+        cpu.max_multiplier = 5.5
+        bus_flags = 0x000d0224
+        features = 0x14190000
+        memory.min = 8192
+        memory.max = 1572864
+        memory.step = 8192
+        nvrmask = 255
+        kbc_p1 = 0x00000cf0
+        gpio = 0xffffffff
+        gpio_acpi = 0xffffffff
+    }
+
+    runtime {
+        firmware linear "roms/machines/p5a/1011.005" 0xc0000 262144 0
+        platform at.common
+        pci config_type_1
+        slot 0x00 northbridge route [none, none, none, none]
+        slot 0x01 agp_bridge route [A, B, none, none]
+        slot 0x07 southbridge route [A, B, C, D]
+        slot 0x0f southbridge_ide route [A, B, C, D]
+        slot 0x03 southbridge_pmu route [A, B, C, D]
+        slot 0x02 southbridge_usb route [A, B, C, D]
+        slot 0x09 expansion route [D, A, B, C]
+        slot 0x0a expansion route [C, D, A, B]
+        slot 0x0b expansion route [B, C, D, A]
+        slot 0x0c expansion route [A, B, C, D]
+        device ali.m1541
+        device ali.m1543c
+        device flash.sst_39sf020
+        spd sdram 0x07 512
+        device hwm.w83781d_p5a
+    }
+}

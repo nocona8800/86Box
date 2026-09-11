@@ -109,5 +109,7 @@ typedef struct machine_ir_desc_t {
 int machine_ir_execute(const struct _machine_ *model, const machine_ir_desc_t *desc);
 int machine_ir_validate(const machine_ir_desc_t *desc, char *error, size_t error_size);
 int machine_ir_execute_file(const struct _machine_ *model, const char *machine_id);
+int machine_dsl_register_directory(const char *directory);
+int machine_dsl_dynamic_init(const struct _machine_ *model);
 
 #endif /* EMU_MACHINE_DSL_H */

@@ -3,6 +3,9 @@ CMakeUserPresets.json
 CMakeCache.txt
 CMakeFiles
 /build
+/build-dsl/
+/.ninja_log
+/.ninja_deps
 *.a
 /src/*.exe
 /src/86Box
@@ -72,3 +75,7 @@ CMakeLists.txt.user
 *.patch
 *.*.orig
 *.*.rej
+
+# Python authoring toolkit caches
+__pycache__/
+*.py[cod]

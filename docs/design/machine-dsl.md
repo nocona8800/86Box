@@ -1,6 +1,6 @@
 # 86Box machine description DSL
 
-Status: schema proposal plus an initial implementation on `dsl-branch`. The authoring frontend and runtime IR are usable; registry-aware source-to-C lowering and external packs remain later milestones.
+Status: runtime-only machine catalogue prototype on `dsl-branch`. The compiled-in `machine_t` rows have been removed; machines must register from complete root `.86m` catalogue blocks. The legacy C initializer and device implementations remain available during migration but are no longer catalogue entries.
 
 ## Implemented vertical slice
 
@@ -11,6 +11,12 @@ Status: schema proposal plus an initial implementation on `dsl-branch`. The auth
 - Advanced source constructs are parsed by the authoring toolkit today. Runtime descriptions use the normalized `runtime` block; higher-level constructs must be lowered to that finite form or rejected.
 
 The four pilot `.86m` files under `src/machine/dsl` are deployed beside 86Box. At boot, 86Box discovers the selected file, parses it, resolves registered device IDs, validates the resulting IR, and executes it. CMake copies the source files but performs no DSL generation.
+
+A file in `<userfiles>/machines` or `<86Box executable>/machines` becomes a machine-table entry before configuration and UI initialization. `extends` remains supported for inheritance between already registered `.86m` machines, but there is no longer a compiled-in C catalogue to inherit from. Reusing an existing ID is rejected as a duplicate.
+
+Root machines omit `extends` and provide a complete `catalogue` block. Required fields are `type`, `chipset`, CPU package/bus/voltage/multiplier limits, numeric `bus_flags` and `features`, and the memory minimum/maximum/step in KiB. `nvrmask`, `kbc_p1`, `gpio`, and `gpio_acpi` are optional. This form creates a machine without copying any compiled-in `machine_t` entry.
+
+The old machine set has deliberately not been translated yet. A build with no externally installed complete root descriptions exits with a clear diagnostic instead of entering configuration code with an invalid machine index.
 
 ## Decision
 

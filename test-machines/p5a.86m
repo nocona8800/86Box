@@ -1,0 +1,58 @@
+# Stress-test override for the ASUS P5A.
+#
+# This preserves the real board topology while exercising every currently
+# executable runtime-IR category that is safe for this machine:
+# firmware, platform selection, PCI initialization, multifunction chipset
+# routing, six expansion/onboard slots, ordered devices, SPD, GPIO defaults,
+# ACPI GPIO defaults, conditional onboard hardware, and result capture.
+schema 1
+
+machine p5a {
+    name = "[DSL stress test] ASUS P5A"
+
+    runtime {
+        firmware linear "roms/machines/p5a/1011.005" 0xc0000 262144 0
+        platform at.common
+
+        # Exercise both machine-level latch defaults.
+        gpio default 0xffffffff
+        gpio acpi_default 0xffffffff
+
+        # ALi Aladdin V uses PCI configuration mechanism 1.
+        pci config_type_1
+
+        # Chipset and southbridge functions.
+        slot 0x00 northbridge route [none, none, none, none]
+        slot 0x01 agp_bridge route [A, B, none, none]
+        slot 0x07 southbridge route [A, B, C, D]
+        slot 0x0f southbridge_ide route [A, B, C, D]
+        slot 0x03 southbridge_pmu route [A, B, C, D]
+        slot 0x02 southbridge_usb route [A, B, C, D]
+
+        # Physical expansion slots and their interrupt swizzles.
+        slot 0x09 expansion route [D, A, B, C]
+        slot 0x0a expansion route [C, D, A, B]
+        slot 0x0b expansion route [B, C, D, A]
+        slot 0x0c expansion route [A, B, C, D]
+        slot 0x0d expansion route [D, A, B, C]
+
+        # Onboard ESS Solo-1 function.
+        slot 0x06 sound route [C, D, A, B]
+
+        # Device order is intentional and mirrors the real C initializer.
+        device ali.m1541
+        device ali.m1543c
+        device flash.sst_39sf020
+        spd sdram 0x07 512
+        device hwm.w83781d_p5a
+
+        # Exercise both GPIO-default opcodes. These are the machine-table
+        # defaults for this board, so the stress test remains boot-safe.
+        gpio default 0xffffffff
+        gpio acpi_default 0xffffffff
+
+        # Resolve the machine's selected onboard sound device only when the UI
+        # is configured for Internal, and retain the returned private handle.
+        device onboard.sound when sound.internal capture machine_snd
+    }
+}

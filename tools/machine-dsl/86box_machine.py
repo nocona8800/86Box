@@ -283,7 +283,9 @@ def validate(documents: Sequence[Document]) -> list[str]:
                 continue
             if "extends" in words:
                 index = words.index("extends")
-                if index + 1 >= len(words) or words[index + 1].strip('"') not in profiles:
+                missing_base = index + 1 >= len(words)
+                external_machine_base = identity[0] == "machine" and not missing_base
+                if missing_base or (not external_machine_base and words[index + 1].strip('"') not in profiles):
                     errors.append(f"{document.path}:{declaration.line}:1: error: unknown base profile after 'extends'")
             if identity[0] == "machine" and declaration.children is not None:
                 has_name = any(s.words()[:2] == ["name", "="] for s in declaration.children)

@@ -351,10 +351,10 @@ typedef struct _machine_ {
     uint32_t             (*gpio_handler)(uint8_t write, uint32_t val);
     uintptr_t              available_flag;
     uint32_t             (*gpio_acpi_handler)(uint8_t write, uint32_t val);
-    const machine_cpu_t    cpu;
+    machine_cpu_t          cpu;
     uintptr_t              bus_flags;
     uintptr_t              flags;
-    const machine_memory_t ram;
+    machine_memory_t       ram;
     int                    ram_granularity;
     int                    nvrmask;
     int                    jumpered_ecp_dma;
@@ -402,13 +402,20 @@ typedef struct _machine_ {
 /* Global variables. */
 extern const machine_filter_t machine_types[];
 extern const machine_filter_t machine_chipsets[];
-extern const machine_t        machines[];
+/* The catalogue begins with the compiled-in table and may be extended by
+   runtime .86m descriptions during startup.  Entries remain stable for the
+   lifetime of the process. */
+extern const machine_t       *machines;
 extern int                    bios_only;
 extern int                    machine;
 extern void *                 machine_snd;
 
 /* Core functions. */
 extern int             machine_count(void);
+extern int             machine_register_from_base(const char *internal_name,
+                                                  const char *display_name,
+                                                  const char *base_internal_name);
+extern int             machine_register_root(const machine_t *description);
 extern int             machine_available(int m);
 extern const char *    machine_getname(int m);
 extern const char *    machine_get_internal_name(void);

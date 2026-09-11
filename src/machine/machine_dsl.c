@@ -18,10 +18,12 @@
 #include <86box/path.h>
 #include <86box/rom.h>
 #include <86box/plat.h>
+#include <86box/plat_dir.h>
 #include <86box/sio.h>
 #include <86box/sound.h>
 #include <86box/spd.h>
 #include <86box/video.h>
+#include "cpu.h"
 
 #define MACHINE_IR_MAX_OPS 256
 #define MACHINE_IR_LINE_SIZE 1024
@@ -509,5 +511,184 @@ machine_ir_execute_file(const machine_t *model, const char *machine_id)
         return 0;
     }
     fclose(file);
+    pclog("Machine DSL: loaded '%s' from %s (%u operations)\n",
+          machine_id, path, (unsigned) source.desc.op_count);
     return machine_ir_execute(model, &source.desc);
+}
+
+int
+machine_dsl_dynamic_init(const machine_t *model)
+{
+    return machine_ir_execute_file(model, model->internal_name);
+}
+
+static int
+machine_dsl_read_catalogue(FILE *file, const char *file_id, char *name,
+                           size_t name_size, char *base, size_t base_size,
+                           machine_t *root, int *is_root)
+{
+    char line_buffer[MACHINE_IR_LINE_SIZE];
+    int  found_machine = 0, catalogue_depth = 0, brace_depth = 0;
+    uint32_t required = 0;
+    enum { CAT_TYPE=1u<<0, CAT_CHIPSET=1u<<1, CAT_PACKAGE=1u<<2,
+           CAT_MIN_BUS=1u<<3, CAT_MAX_BUS=1u<<4, CAT_MIN_V=1u<<5,
+           CAT_MAX_V=1u<<6, CAT_MIN_M=1u<<7, CAT_MAX_M=1u<<8,
+           CAT_BUSES=1u<<9, CAT_FLAGS=1u<<10, CAT_RAM_MIN=1u<<11,
+           CAT_RAM_MAX=1u<<12, CAT_RAM_STEP=1u<<13 };
+    const uint32_t required_all = (1u << 14) - 1;
+
+    name[0] = base[0] = 0;
+    memset(root, 0, sizeof(*root));
+    root->available_flag = MACHINE_AVAILABLE;
+    root->nvrmask = 255;
+    root->default_jumpered_ecp_dma = -1;
+    root->gpio = root->gpio_acpi = 0xffffffff;
+    *is_root = 0;
+    rewind(file);
+    while (fgets(line_buffer, sizeof(line_buffer), file)) {
+        char parsed_id[128] = { 0 };
+        char value[128];
+        char *line;
+        int opens = 0, closes = 0;
+        machine_ir_strip_comment(line_buffer);
+        line = machine_ir_trim(line_buffer);
+        for (char *p = line; *p; p++) { if (*p == '{') opens++; else if (*p == '}') closes++; }
+        if (!found_machine) {
+            if (sscanf(line, "machine %127s extends %127s {", parsed_id, base) == 2) {
+                char *end;
+                if (parsed_id[0] == '"')
+                    memmove(parsed_id, parsed_id + 1, strlen(parsed_id));
+                end = strpbrk(parsed_id, "\"{");
+                if (end) *end = 0;
+                end = strpbrk(base, "\"{");
+                if (end) *end = 0;
+                if (strcmp(parsed_id, file_id))
+                    return 0;
+                found_machine = 1;
+                brace_depth = opens - closes;
+            } else if (sscanf(line, "machine %127s {", parsed_id) == 1) {
+                char *end = strpbrk(parsed_id, "\"{");
+                if (parsed_id[0] == '"')
+                    memmove(parsed_id, parsed_id + 1, strlen(parsed_id));
+                end = strpbrk(parsed_id, "\"{");
+                if (end) *end = 0;
+                if (strcmp(parsed_id, file_id))
+                    return 0;
+                found_machine = *is_root = 1;
+                brace_depth = opens - closes;
+            }
+            continue;
+        }
+        if (!catalogue_depth && !strncmp(line, "catalogue", 9) && strchr(line, '{')) {
+            catalogue_depth = brace_depth + 1;
+        } else if (catalogue_depth && !(closes && brace_depth == catalogue_depth)) {
+            unsigned number;
+            float decimal;
+            if (sscanf(line, "type = %127s", value) == 1) {
+                static const struct { const char *name; unsigned value; } map[] = {
+                    { "8088", MACHINE_TYPE_8088 }, { "286", MACHINE_TYPE_286 },
+                    { "386sx", MACHINE_TYPE_386SX }, { "386dx", MACHINE_TYPE_386DX },
+                    { "socket3", MACHINE_TYPE_SOCKET3 }, { "socket3_pci", MACHINE_TYPE_SOCKET3_PCI },
+                    { "socket5", MACHINE_TYPE_SOCKET5 }, { "socket7", MACHINE_TYPE_SOCKET7 },
+                    { "super_socket7", MACHINE_TYPE_SOCKETS7 }, { "slot1", MACHINE_TYPE_SLOT1 },
+                    { "socket370", MACHINE_TYPE_SOCKET370 }, { "misc", MACHINE_TYPE_MISC }, { NULL, 0 }
+                };
+                for (int i=0; map[i].name; i++) if (!strcmp(value,map[i].name)) { root->type=map[i].value; required|=CAT_TYPE; }
+            } else if (sscanf(line, "chipset = %127s", value) == 1) {
+                static const struct { const char *name; unsigned value; } map[] = {
+                    { "none", MACHINE_CHIPSET_NONE }, { "discrete", MACHINE_CHIPSET_DISCRETE },
+                    { "ali.aladdin_v", MACHINE_CHIPSET_ALI_ALADDIN_V },
+                    { "intel.i430tx", MACHINE_CHIPSET_INTEL_430TX },
+                    { "via.mvp3", MACHINE_CHIPSET_VIA_APOLLO_MVP3 }, { NULL, 0 }
+                };
+                for (int i=0; map[i].name; i++) if (!strcmp(value,map[i].name)) { root->chipset=map[i].value; required|=CAT_CHIPSET; }
+            } else if (sscanf(line, "cpu.package = %127s", value) == 1) {
+                static const struct { const char *name; unsigned value; } map[] = {
+                    { "8088", CPU_PKG_8088 }, { "286", CPU_PKG_286 }, { "386sx", CPU_PKG_386SX },
+                    { "386dx", CPU_PKG_386DX }, { "socket3", CPU_PKG_SOCKET3 },
+                    { "socket5_7", CPU_PKG_SOCKET5_7 }, { "socket8", CPU_PKG_SOCKET8 },
+                    { "slot1", CPU_PKG_SLOT1 }, { "slot2", CPU_PKG_SLOT2 },
+                    { "socket370", CPU_PKG_SOCKET370 }, { NULL, 0 }
+                };
+                for (int i=0; map[i].name; i++) if (!strcmp(value,map[i].name)) { root->cpu.package=map[i].value; required|=CAT_PACKAGE; }
+            } else if (sscanf(line, "cpu.min_bus = %u", &number)==1) { root->cpu.min_bus=number; required|=CAT_MIN_BUS;
+            } else if (sscanf(line, "cpu.max_bus = %u", &number)==1) { root->cpu.max_bus=number; required|=CAT_MAX_BUS;
+            } else if (sscanf(line, "cpu.min_voltage = %u", &number)==1) { root->cpu.min_voltage=number; required|=CAT_MIN_V;
+            } else if (sscanf(line, "cpu.max_voltage = %u", &number)==1) { root->cpu.max_voltage=number; required|=CAT_MAX_V;
+            } else if (sscanf(line, "cpu.min_multiplier = %f", &decimal)==1) { root->cpu.min_multi=decimal; required|=CAT_MIN_M;
+            } else if (sscanf(line, "cpu.max_multiplier = %f", &decimal)==1) { root->cpu.max_multi=decimal; required|=CAT_MAX_M;
+            } else if (sscanf(line, "bus_flags = %x", &number)==1) { root->bus_flags=number; required|=CAT_BUSES;
+            } else if (sscanf(line, "features = %x", &number)==1) { root->flags=number; required|=CAT_FLAGS;
+            } else if (sscanf(line, "memory.min = %u", &number)==1) { root->ram.min=number; required|=CAT_RAM_MIN;
+            } else if (sscanf(line, "memory.max = %u", &number)==1) { root->ram.max=number; required|=CAT_RAM_MAX;
+            } else if (sscanf(line, "memory.step = %u", &number)==1) { root->ram.step=number; required|=CAT_RAM_STEP;
+            } else if (sscanf(line, "nvrmask = %i", &root->nvrmask)==1) {
+            } else if (sscanf(line, "kbc_p1 = %x", &root->kbc_p1)==1) {
+            } else if (sscanf(line, "gpio = %x", &root->gpio)==1) {
+            } else if (sscanf(line, "gpio_acpi = %x", &root->gpio_acpi)==1) { }
+        } else if (sscanf(line, "name = \"%511[^\"]\"", name) == 1) {
+            root->name = name;
+            root->internal_name = file_id;
+            root->init = machine_dsl_dynamic_init;
+        }
+        if (catalogue_depth && closes && brace_depth == catalogue_depth)
+            catalogue_depth = 0;
+        brace_depth += opens - closes;
+    }
+    return found_machine && name[0] && ((*is_root && required == required_all) || (!*is_root && base[0]));
+}
+
+int
+machine_dsl_register_directory(const char *directory)
+{
+    plat_dir_t context = PLAT_DIR_INIT;
+    char path[1024], id[128], name[512], base[128], error[512];
+    machine_t root;
+    int is_root;
+    int registered = 0;
+
+    if (!directory || !*directory || !plat_dir_open(&context, directory))
+        return 0;
+    while (plat_dir_read(&context)) {
+        const char *filename = plat_dir_get_name(&context);
+        size_t length = strlen(filename);
+        if (!plat_dir_is_file(&context) || length <= 4 || strcmp(filename + length - 4, ".86m"))
+            continue;
+        if (length - 4 >= sizeof(id))
+            continue;
+        memcpy(id, filename, length - 4);
+        id[length - 4] = 0;
+        path_append_filename(path, directory, filename);
+        FILE *file = plat_fopen(path, "rb");
+        if (!file)
+            continue;
+        if (machine_get_machine_from_internal_name(id) >= 0) {
+            fclose(file); /* Existing IDs are deliberate runtime overrides. */
+            continue;
+        }
+        if (!machine_dsl_read_catalogue(file, id, name, sizeof(name), base, sizeof(base), &root, &is_root)) {
+            fclose(file);
+            pclog("Machine DSL: ignored unregistered '%s' (root machines require a complete catalogue block)\n", path);
+            continue;
+        }
+        machine_ir_source_t source;
+        rewind(file);
+        if (!machine_ir_parse_file(file, id, &source, error, sizeof(error))) {
+            fclose(file);
+            pclog("Machine DSL: cannot register %s: %s\n", path, error);
+            continue;
+        }
+        fclose(file);
+        if (!(is_root ? machine_register_root(&root) : machine_register_from_base(id, name, base))) {
+            pclog("Machine DSL: cannot register '%s': base '%s' was not found or ID is duplicated\n", id, base);
+            continue;
+        }
+        if (is_root)
+            pclog("Machine DSL: registered root machine '%s' as %s\n", id, name);
+        else
+            pclog("Machine DSL: registered '%s' as %s (inherits catalogue from '%s')\n", id, name, base);
+        registered++;
+    }
+    plat_dir_close(&context);
+    return registered;
 }
