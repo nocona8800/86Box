@@ -1,0 +1,62 @@
+# Root catalogue example reconstructed from the former C machine-table row.
+# Numeric bus/feature masks are the normalized schema-1 representation.
+schema 1
+
+machine p3bf {
+    name = "[i440BX] ASUS P3B-F"
+
+    catalogue {
+        type = slot1
+        chipset = intel.i440bx
+
+        cpu.package = slot1
+        cpu.min_bus = 66666667
+        cpu.max_bus = 150000000
+        cpu.min_voltage = 1300
+        cpu.max_voltage = 3500
+        cpu.min_multiplier = 1.5
+        cpu.max_multiplier = 8.0
+
+        # MACHINE_PS2_AGP | MACHINE_BUS_USB
+        bus_flags = 0x000d0224
+        # MACHINE_IDE_DUAL | MACHINE_APM | MACHINE_ACPI | MACHINE_USB
+        features = 0x14180000
+
+        memory.min = 8192
+        memory.max = 1048576
+        memory.step = 8192
+
+        nvrmask = 255
+        kbc_p1 = 0x00000cf0
+        gpio = 0xffffffff
+        gpio_acpi = 0xffffffff
+    }
+
+    runtime {
+        firmware linear "roms/machines/p3bf/1008f.004" 0xc0000 262144 0
+        platform at.common
+
+        pci config_type_1
+        slot 0x00 northbridge route [none, none, none, none]
+        slot 0x04 southbridge route [A, B, C, D]
+        slot 0x09 expansion route [D, A, B, C]
+        slot 0x0a expansion route [C, D, A, B]
+        slot 0x0b expansion route [B, C, D, A]
+        slot 0x0c expansion route [A, B, C, D]
+        slot 0x0d expansion route [D, A, B, C]
+        slot 0x0e expansion route [C, D, A, B]
+        slot 0x01 agp_bridge route [A, B, C, D]
+
+        device intel.i440bx
+        device intel.piix4e
+        # W83977EF | W83977_AMI | W83977_NO_NVR
+        device sio.w83977 params 0x52f012
+        device clock.ics9250_08
+        device flash.sst_39sf020
+        spd sdram 0x0f 256
+        device hwm.as99127f
+
+        # The former C initializer also copied voltage channel 5 to channel 4.
+        # That tiny HWM transform needs a declarative register/value operation.
+    }
+}

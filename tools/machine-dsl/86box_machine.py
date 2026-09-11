@@ -57,6 +57,8 @@ class Document:
 PUNCTUATION = set("{}[]=,:;().")
 RUNTIME_DEVICES = {
     "ali.m1541", "ali.m1543c", "flash.sst_39sf020", "flash.sst_29ee010",
+    "intel.i440bx", "intel.piix4e", "sio.w83977", "clock.ics9250_08",
+    "hwm.as99127f",
     "hwm.w83781d_p5a", "intel.i430tx", "intel.piix4", "sio.pc87307",
     "flash.intel_bxt", "onboard.sound", "onboard.video", "onboard.network",
 }

@@ -6,6 +6,7 @@
 #include <86box/86box.h>
 #include <86box/device.h>
 #include <86box/chipset.h>
+#include <86box/clock.h>
 #include <86box/flash.h>
 #include <86box/hwm.h>
 #include <86box/machine.h>
@@ -47,6 +48,10 @@ static const machine_ir_device_registry_t machine_ir_devices[] = {
     { "hwm.w83781d_p5a",       &w83781d_p5a_device },
     { "intel.i430tx",          &i430tx_device },
     { "intel.piix4",           &piix4_device },
+    { "intel.i440bx",          &i440bx_device },
+    { "intel.piix4e",          &piix4e_device },
+    { "sio.w83977",            &w83977_device },
+    { "hwm.as99127f",          &as99127f_device },
     { "sio.pc87307",           &pc87307_device },
     { "flash.intel_bxt",       &intel_flash_bxt_device },
     { NULL, NULL }
@@ -55,6 +60,8 @@ static const machine_ir_device_registry_t machine_ir_devices[] = {
 static const device_t *
 machine_ir_device_from_id(const char *id)
 {
+    if (!strcmp(id, "clock.ics9250_08"))
+        return ics9xxx_get(ICS9250_08);
     for (const machine_ir_device_registry_t *entry = machine_ir_devices; entry->id; entry++)
         if (!strcmp(entry->id, id))
             return entry->device;
@@ -599,6 +606,7 @@ machine_dsl_read_catalogue(FILE *file, const char *file_id, char *name,
                     { "none", MACHINE_CHIPSET_NONE }, { "discrete", MACHINE_CHIPSET_DISCRETE },
                     { "ali.aladdin_v", MACHINE_CHIPSET_ALI_ALADDIN_V },
                     { "intel.i430tx", MACHINE_CHIPSET_INTEL_430TX },
+                    { "intel.i440bx", MACHINE_CHIPSET_INTEL_440BX },
                     { "via.mvp3", MACHINE_CHIPSET_VIA_APOLLO_MVP3 }, { NULL, 0 }
                 };
                 for (int i=0; map[i].name; i++) if (!strcmp(value,map[i].name)) { root->chipset=map[i].value; required|=CAT_CHIPSET; }
@@ -634,6 +642,22 @@ machine_dsl_read_catalogue(FILE *file, const char *file_id, char *name,
         if (catalogue_depth && closes && brace_depth == catalogue_depth)
             catalogue_depth = 0;
         brace_depth += opens - closes;
+    }
+    if (*is_root && required != required_all) {
+        static const struct { uint32_t bit; const char *name; } fields[] = {
+            { CAT_TYPE, "type" }, { CAT_CHIPSET, "chipset" }, { CAT_PACKAGE, "cpu.package" },
+            { CAT_MIN_BUS, "cpu.min_bus" }, { CAT_MAX_BUS, "cpu.max_bus" },
+            { CAT_MIN_V, "cpu.min_voltage" }, { CAT_MAX_V, "cpu.max_voltage" },
+            { CAT_MIN_M, "cpu.min_multiplier" }, { CAT_MAX_M, "cpu.max_multiplier" },
+            { CAT_BUSES, "bus_flags" }, { CAT_FLAGS, "features" },
+            { CAT_RAM_MIN, "memory.min" }, { CAT_RAM_MAX, "memory.max" },
+            { CAT_RAM_STEP, "memory.step" }, { 0, NULL }
+        };
+        pclog("Machine DSL: root machine '%s' has an incomplete catalogue; missing or invalid:", file_id);
+        for (int i = 0; fields[i].name; i++)
+            if (!(required & fields[i].bit))
+                pclog(" %s", fields[i].name);
+        pclog("\n");
     }
     return found_machine && name[0] && ((*is_root && required == required_all) || (!*is_root && base[0]));
 }
