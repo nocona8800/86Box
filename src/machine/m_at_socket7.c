@@ -34,6 +34,7 @@
 #include <86box/spd.h>
 #include "cpu.h"
 #include <86box/machine.h>
+#include <86box/machine_dsl.h>
 #include <86box/timer.h>
 #include <86box/fdd.h>
 #include <86box/fdc.h>
@@ -1771,35 +1772,7 @@ machine_at_ym430tx_init(const machine_t *model)
 int
 machine_at_tx97xv_init(const machine_t *model)
 {
-    int ret;
-
-    ret = bios_load_linear("roms/machines/tx97xv/Bios.rom",
-                           0x000c0000, 262144, 0);
-
-    if (bios_only || !ret)
-        return ret;
-
-    machine_at_common_init(model);
-
-    pci_init(PCI_CONFIG_TYPE_1);
-    pci_register_slot(0x00, PCI_CARD_NORTHBRIDGE, 1, 2, 3, 4);
-    pci_register_slot(0x01, PCI_CARD_SOUTHBRIDGE, 1, 2, 3, 4); /* PIIX4 */
-    pci_register_slot(0x09, PCI_CARD_NORMAL,      4, 1, 2, 3);
-    pci_register_slot(0x0A, PCI_CARD_NORMAL,      3, 4, 1, 2);
-    pci_register_slot(0x0B, PCI_CARD_NORMAL,      2, 3, 4, 1);
-    pci_register_slot(0x0C, PCI_CARD_NORMAL,      1, 2, 3, 4);
-    pci_register_slot(0x0D, PCI_CARD_VIDEO,       1, 0, 0, 0);
-
-    device_add(&i430tx_device);
-    device_add(&piix4_device);
-    device_add_params(&pc87307_device, (void *) (PCX730X_AMI | PCX7307_PC87307 | PCX730X_02E));
-    device_add(&intel_flash_bxt_device);
-    spd_register(SPD_TYPE_SDRAM, 0x3, 128);
-
-    if ((gfxcard[0] == VID_INTERNAL) && machine_get_vid_device(machine))
-        device_add(machine_get_vid_device(machine));
-
-    return ret;
+    return machine_ir_execute_file(model, "tx97xv");
 }
 
 int

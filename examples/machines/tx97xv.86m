@@ -1,0 +1,43 @@
+# Design fixture matching the IR-backed HP Pavilion 81xx initializer.
+schema 1
+
+machine tx97xv {
+    name = "[i430TX] HP Pavilion 81xx"
+    family = socket7
+    chipset = intel.i430tx
+    platform = at.common
+
+    firmware bios {
+        load linear {
+            file = "roms/machines/tx97xv/Bios.rom"
+            address = 0x000c0000
+            size = 256 KiB
+        }
+    }
+
+    pci {
+        mechanism = config_type_1
+        slot 0x00 northbridge route [A, B, C, D]
+        slot 0x01 southbridge route [A, B, C, D]
+        slot 0x09 expansion   route [D, A, B, C]
+        slot 0x0a expansion   route [C, D, A, B]
+        slot 0x0b expansion   route [B, C, D, A]
+        slot 0x0c expansion   route [A, B, C, D]
+        slot 0x0d video       route [A, none, none, none]
+    }
+
+    devices {
+        add intel.i430tx
+        add intel.piix4
+        add sio.pc87307 with_raw 0x032c0
+        add flash.intel_bxt
+        spd sdram {
+            slots = 0b11
+            max_module = 128 MiB
+        }
+    }
+
+    when selected.video == internal and onboard.video exists {
+        add onboard.video
+    }
+}

@@ -1,0 +1,22 @@
+schema 1
+machine "5aa" {
+    name = "[ALi ALADDiN V] Gigabyte GA-5AA"
+    runtime {
+        firmware linear "roms/machines/5aa/GA-5AA.F7b" 0xe0000 131072 0
+        platform at.common
+        pci config_type_1
+        slot 0x00 northbridge route [none, none, none, none]
+        slot 0x01 agp_bridge route [A, B, none, none]
+        slot 0x07 southbridge route [A, B, C, D]
+        slot 0x0f southbridge_ide route [A, B, C, D]
+        slot 0x03 southbridge_pmu route [A, B, C, D]
+        slot 0x02 southbridge_usb route [A, B, C, D]
+        slot 0x08 expansion route [A, B, C, D]
+        slot 0x09 expansion route [B, C, D, A]
+        slot 0x0a expansion route [C, D, A, B]
+        device ali.m1541
+        device ali.m1543c
+        device flash.sst_29ee010
+        spd sdram 0x07 512
+    }
+}

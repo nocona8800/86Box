@@ -1,0 +1,45 @@
+# Design sketch based on the existing Endeavor GPIO handler.
+# It illustrates the desired boundary; IDs/endpoints require registry work.
+schema 1
+
+gpio endeavor_straps width 32 {
+    reset = 0xffffffff
+    read = latched
+    writable mask 0x00000030
+
+    field sound_base bits 4..5 {
+        on write call onboard_sound.relocate_base {
+            0b00: 0x220
+            0b01: 0x260
+            0b10: 0x240
+            0b11: 0x280
+        }
+    }
+
+    field fsb_strap bits 11..12
+    field audio_present bit 10
+    field multiplier_1_5 bit 8
+
+    defaults {
+        fsb_strap = match cpu.fsb {
+            .. 50 MHz: 0b00
+            .. 60 MHz: 0b01
+            else:      0b10
+        }
+        audio_present = selected.sound == internal
+        multiplier_1_5 = cpu.multiplier <= 1.5
+    }
+}
+
+# The complete machine can migrate once its devices and ROM-combination loader
+# have stable registry IDs. Any remaining unmodelled behavior gets one narrow,
+# phase-specific hook rather than an arbitrary script block.
+machine endeavor_gpio_design {
+    name = "Intel Advanced/EV (Endeavor) - GPIO design fixture"
+    gpio = endeavor_straps
+
+    native {
+        post_init = "machine.endeavor.remaining_post_init.v1"
+        reason = "Temporary: remove after remaining board-specific side effects become typed device commands."
+    }
+}

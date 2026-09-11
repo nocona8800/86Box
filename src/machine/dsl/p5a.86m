@@ -1,0 +1,27 @@
+schema 1
+machine p5a {
+    name = "[ALi ALADDiN V] ASUS P5A"
+    runtime {
+        firmware linear "roms/machines/p5a/1011.005" 0xc0000 262144 0
+        platform at.common
+        pci config_type_1
+        slot 0x00 northbridge route [none, none, none, none]
+        slot 0x01 agp_bridge route [A, B, none, none]
+        slot 0x07 southbridge route [A, B, C, D]
+        slot 0x0f southbridge_ide route [A, B, C, D]
+        slot 0x03 southbridge_pmu route [A, B, C, D]
+        slot 0x02 southbridge_usb route [A, B, C, D]
+        slot 0x09 expansion route [D, A, B, C]
+        slot 0x0a expansion route [C, D, A, B]
+        slot 0x0b expansion route [B, C, D, A]
+        slot 0x0c expansion route [A, B, C, D]
+        slot 0x0d expansion route [D, A, B, C]
+        slot 0x06 sound route [C, D, A, B]
+        device ali.m1541
+        device ali.m1543c
+        device flash.sst_39sf020
+        spd sdram 0x07 512
+        device hwm.w83781d_p5a
+        device onboard.sound when sound.internal capture machine_snd
+    }
+}

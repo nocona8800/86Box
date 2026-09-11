@@ -274,6 +274,16 @@ add_subdirectory(disk)
 add_subdirectory(floppy)
 add_subdirectory(game)
 add_subdirectory(machine)
+
+# .86m files are runtime inputs. CMake only deploys them; 86Box parses and
+# validates them into machine_ir_desc_t objects during startup.
+add_custom_target(machine_dsl_files ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/machine/dsl"
+            "${CMAKE_CURRENT_BINARY_DIR}/machines"
+    COMMENT "Copying runtime 86Box machine descriptions"
+)
+add_dependencies(86Box machine_dsl_files)
 add_subdirectory(mem)
 add_subdirectory(network)
 add_subdirectory(printer)

@@ -1,0 +1,69 @@
+# Design fixture for schema-1 advanced constructs. The toolkit parses and
+# validates its structure; a registry-aware lowering pass must resolve names.
+schema 1
+
+sequence add_piix4_board(northbridge, superio, flash) {
+    add $northbridge
+    add intel.piix4
+    add $superio
+    add $flash
+}
+
+gpio advanced_straps width 32 {
+    reset = 0xffffffff
+    field sound_base bits 4..5
+}
+
+machine advanced_fixture {
+    name = "Advanced special-case fixture"
+    platform = at.common
+    gpio = advanced_straps
+
+    resource bios_release {
+        path = "roms/machines/example/release.bin"
+        size = 256 KiB
+        sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+
+    variant config.bios {
+        default = "release"
+        case "release" {
+            firmware bios = bios_release
+        }
+    }
+
+    devices {
+        run add_piix4_board(intel.i430tx, sio.pc87307, flash.intel_bxt)
+    }
+
+    register_bank board_io on isa.io {
+        register control at 0x79 width 8 {
+            reset = 0xff
+            readable mask 0xff
+            writable mask 0x30
+            field sound_base bits 4..5
+        }
+        on control.sound_base changed {
+            call onboard_sound.relocate_base map {
+                0: 0x220
+                1: 0x260
+                2: 0x240
+                3: 0x280
+            }
+        }
+    }
+
+    state_machine power_logic initial running {
+        state running
+        state suspended
+        transition running -> suspended on acpi.suspend {
+            emit cpu.suspend
+        }
+        transition suspended -> running on power_button {
+            emit cpu.resume
+        }
+    }
+
+    assert pci.slot[0x00].role == northbridge
+    require emulator.machine_ir >= 1
+}

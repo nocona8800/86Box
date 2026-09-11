@@ -1,0 +1,22 @@
+schema 1
+machine tx97xv {
+    name = "[i430TX] HP Pavilion 81xx"
+    runtime {
+        firmware linear "roms/machines/tx97xv/Bios.rom" 0xc0000 262144 0
+        platform at.common
+        pci config_type_1
+        slot 0x00 northbridge route [A, B, C, D]
+        slot 0x01 southbridge route [A, B, C, D]
+        slot 0x09 expansion route [D, A, B, C]
+        slot 0x0a expansion route [C, D, A, B]
+        slot 0x0b expansion route [B, C, D, A]
+        slot 0x0c expansion route [A, B, C, D]
+        slot 0x0d video route [A, none, none, none]
+        device intel.i430tx
+        device intel.piix4
+        device sio.pc87307 params 0x32c0
+        device flash.intel_bxt
+        spd sdram 0x03 128
+        device onboard.video when video.internal
+    }
+}

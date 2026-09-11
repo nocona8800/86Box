@@ -1,0 +1,141 @@
+# Design fixture; not consumed by the current build.
+schema 1
+
+profile ali_aladdin_v_ss7 {
+    family = super_socket7
+    chipset = ali.aladdin_v
+    platform = at.common
+
+    cpu {
+        socket = socket5_7
+        voltage = 1.300 V .. 3.520 V
+        multiplier = 1.5 .. 5.5
+    }
+
+    buses = [isa, isa16, pci, agp, ps2, usb]
+    features = [ide.primary, ide.secondary, apm, acpi, usb]
+
+    defaults {
+        nvr_mask = 0xff
+        kbc.p1 = 0x00000cf0
+        gpio = 0xffffffff
+        gpio_acpi = 0xffffffff
+    }
+
+    pci {
+        mechanism = config_type_1
+        slot 0x00 northbridge     route [none, none, none, none]
+        slot 0x01 agp_bridge      route [A, B, none, none]
+        slot 0x07 southbridge     route [A, B, C, D]
+        slot 0x0f southbridge_ide route [A, B, C, D]
+        slot 0x03 southbridge_pmu route [A, B, C, D]
+        slot 0x02 southbridge_usb route [A, B, C, D]
+    }
+
+    devices {
+        add ali.m1541 as northbridge
+        add ali.m1543c as southbridge
+    }
+}
+
+machine p5a extends ali_aladdin_v_ss7 {
+    name = "[ALi ALADDiN V] ASUS P5A"
+    cpu.fsb = 60 MHz .. 120 MHz
+    memory { range = 8 MiB .. 1536 MiB; step = 8 MiB }
+    append features = [gameport, sound]
+
+    firmware bios {
+        load linear {
+            file = "roms/machines/p5a/1011.005"
+            address = 0x000c0000
+            size = 256 KiB
+        }
+    }
+
+    pci {
+        append slot 0x09 expansion route [D, A, B, C]
+        append slot 0x0a expansion route [C, D, A, B]
+        append slot 0x0b expansion route [B, C, D, A]
+        append slot 0x0c expansion route [A, B, C, D]
+        append slot 0x0d expansion route [D, A, B, C]
+        append slot 0x06 sound     route [C, D, A, B]
+    }
+
+    devices {
+        append add flash.sst_39sf020
+        append spd sdram {
+            slots = 0b111
+            max_module = 512 MiB
+        }
+        append add hwm.w83781d_p5a
+    }
+
+    onboard.sound = sound.ess_solo1_onboard
+    when selected.sound == internal {
+        add onboard.sound as onboard_sound
+    }
+}
+
+machine m579 extends ali_aladdin_v_ss7 {
+    name = "[ALi ALADDiN V] PC Chips M579"
+    cpu.fsb = 66.667 MHz .. 100 MHz
+    cpu.voltage = 2.000 V .. 3.520 V
+    replace features = [ide.primary, ide.secondary, apm, usb]
+    memory {
+        range = 8 MiB .. 1536 MiB
+        step = 8 MiB
+    }
+
+    firmware bios {
+        load linear {
+            file = "roms/machines/m579/MS6260S_Socket7_ALi_M1542_AMI.BIN"
+            address = 0x000e0000
+            size = 128 KiB
+        }
+    }
+
+    pci {
+        append slot 0x10 expansion route [C, D, A, B]
+        append slot 0x12 expansion route [B, C, D, A]
+        append slot 0x14 expansion route [A, B, C, D]
+    }
+
+    devices {
+        append add flash.sst_29ee010
+        append spd sdram {
+            slots = 0b111
+            max_module = 512 MiB
+        }
+    }
+}
+
+machine "5aa" extends ali_aladdin_v_ss7 {
+    name = "[ALi ALADDiN V] Gigabyte GA-5AA"
+    cpu.fsb = 66.667 MHz .. 140 MHz
+    memory {
+        range = 8 MiB .. 1536 MiB
+        step = 8 MiB
+    }
+
+    firmware bios {
+        load linear {
+            file = "roms/machines/5aa/GA-5AA.F7b"
+            address = 0x000e0000
+            size = 128 KiB
+        }
+    }
+
+    pci {
+        append slot 0x08 expansion route [A, B, C, D]
+        append slot 0x09 expansion route [B, C, D, A]
+        append slot 0x0a expansion route [C, D, A, B]
+    }
+
+    devices {
+        append add flash.sst_29ee010
+        append spd sdram {
+            slots = 0b111
+            max_module = 512 MiB
+        }
+    }
+}

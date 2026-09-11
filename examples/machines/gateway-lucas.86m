@@ -1,0 +1,53 @@
+# Design fixture; not consumed by the current build.
+schema 1
+
+machine gwlucas extends ali_aladdin_v_ss7 {
+    name = "[ALi ALADDiN V] Gateway Lucas"
+    aliases = [
+        "MSI MS-5185",
+        "Gateway ATX Select 366",
+        "Gateway ATX Select 400",
+    ]
+
+    cpu {
+        socket = socket5_7
+        fsb = 60 MHz .. 100 MHz
+        voltage = 1.300 V .. 3.520 V
+        multiplier = 1.5 .. 5.5
+    }
+    memory { range = 8 MiB .. 256 MiB; step = 8 MiB }
+    append features = [agp.internal, gameport, sound]
+
+    firmware bios {
+        load linear {
+            file = "roms/machines/gwlucas/gw2kboot.rom"
+            address = 0x000c0000
+            size = 256 KiB
+        }
+    }
+
+    pci {
+        # This board uses 0x0e for the IDE function rather than profile slot 0x0f.
+        remove slot 0x0f
+        append slot 0x0e southbridge_ide route [A, B, C, D]
+        append slot 0x0f sound            route [A, B, C, D]
+        append slot 0x14 expansion        route [B, C, D, A]
+        append slot 0x12 expansion        route [C, D, A, B]
+        append slot 0x10 expansion        route [D, A, B, C]
+    }
+
+    devices {
+        append add flash.sst_39sf020
+        append spd sdram {
+            slots = 0b111
+            max_module = 512 MiB
+        }
+    }
+
+    onboard.sound = sound.ensoniq_es1373_onboard
+    when selected.sound == internal {
+        add onboard.sound as onboard_sound
+        add codec.cs4297 as audio_codec
+        connect onboard_sound.ac97 -> audio_codec.link
+    }
+}

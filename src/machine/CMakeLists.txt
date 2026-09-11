@@ -17,6 +17,7 @@
 
 add_library(mch OBJECT
     machine.c
+    machine_dsl.c
     machine_table.c
     m_xt.c
     m_xt_t1000.c
@@ -62,3 +63,7 @@ add_library(mch OBJECT
     m_at_socket370.c
     m_at_misc.c
 )
+
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dsl/"
+        DESTINATION "machines"
+        FILES_MATCHING PATTERN "*.86m")
